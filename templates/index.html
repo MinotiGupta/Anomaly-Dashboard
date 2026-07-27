@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Anomaly Detection Dashboard – Upload, visualize, and detect anomalies in experimental time-series data with human-in-the-loop feedback.">
+  <title>AnomalyScope – Anomaly Detection Dashboard</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+</head>
+<body>
+
+  <!-- ── Header ── -->
+  <header class="header" id="app-header">
+    <div class="header-brand">
+      <div class="logo">A</div>
+      <div>
+        <h1>AnomalyScope</h1>
+        <span>Unsupervised Anomaly Detection Dashboard</span>
+      </div>
+    </div>
+    <div class="header-actions">
+      <button class="btn btn-secondary btn-sm" id="btn-upload" onclick="document.getElementById('file-input').click()">
+        📤 Upload CSV
+      </button>
+      <input type="file" id="file-input" accept=".csv" style="display:none" onchange="handleUpload(this)">
+      <button class="btn btn-primary btn-sm" id="btn-export" onclick="exportAnnotated()" style="display:none">
+        📥 Export Annotated
+      </button>
+    </div>
+  </header>
+
+  <div class="dashboard">
+
+    <!-- ── Sidebar ── -->
+    <aside class="sidebar" id="sidebar">
+
+      <!-- Experiment Browser -->
+      <div class="sidebar-section">
+        <h3>Experiments</h3>
+        <div id="experiment-tree">
+          <p style="font-size:12px;color:var(--text-muted)">Loading…</p>
+        </div>
+      </div>
+
+      <!-- Upload Zone -->
+      <div class="sidebar-section">
+        <h3>Upload New Data</h3>
+        <div class="form-group">
+          <label for="upload-experiment">Experiment Name</label>
+          <input type="text" id="upload-experiment" placeholder="e.g. MyExperiment">
+        </div>
+        <div class="upload-zone" onclick="document.getElementById('file-input-sidebar').click()">
+          <div class="icon">📂</div>
+          <p>Drop CSV here or click to browse</p>
+        </div>
+        <input type="file" id="file-input-sidebar" accept=".csv" style="display:none" onchange="handleUploadSidebar(this)">
+      </div>
+
+      <!-- Algorithm Config -->
+      <div class="sidebar-section" id="algo-section" style="display:none">
+        <h3>Detection Algorithm</h3>
+        <div class="form-group">
+          <label for="select-channel">Channel</label>
+          <select id="select-channel"></select>
+        </div>
+        <div class="form-group">
+          <label for="select-algo">Algorithm</label>
+          <select id="select-algo" onchange="updateAlgoParams()">
+            <option value="zscore">Z-Score</option>
+            <option value="iqr">IQR (Interquartile Range)</option>
+            <option value="isolation_forest">Isolation Forest</option>
+            <option value="lof">Local Outlier Factor</option>
+            <option value="rolling_stats" selected>Rolling Statistics</option>
+          </select>
+        </div>
+
+        <!-- Dynamic algo params -->
+        <div id="algo-params" class="algo-params"></div>
+
+        <button class="btn btn-primary" style="width:100%;margin-top:8px" onclick="runDetection()">
+          🔍 Detect Anomalies
+        </button>
+      </div>
+
+      <!-- Feedback Summary -->
+      <div class="sidebar-section" id="feedback-section" style="display:none">
+        <h3>Feedback Summary</h3>
+        <div id="feedback-summary">
+          <p style="font-size:12px;color:var(--text-muted)">No feedback yet</p>
+        </div>
+        <button class="btn btn-success btn-sm" style="width:100%;margin-top:8px" onclick="submitAllFeedback()">
+          ✅ Save All Feedback
+        </button>
+      </div>
+
+    </aside>
+
+    <!-- ── Main Content ── -->
+    <main class="main-content" id="main-content">
+
+      <!-- Empty state -->
+      <div id="empty-state" class="empty-state">
+        <div class="icon">📊</div>
+        <h2>Select an experiment to begin</h2>
+        <p>Choose a CSV file from the sidebar or upload your own data to start detecting anomalies.</p>
+      </div>
+
+      <!-- Stats row -->
+      <div id="stats-section" style="display:none" class="fade-in">
+        <div class="stats-grid" id="stats-grid"></div>
+      </div>
+
+      <!-- Main chart -->
+      <div id="chart-section" style="display:none" class="fade-in">
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">
+              <span class="dot"></span>
+              <span id="chart-title">Time Series Visualization</span>
+            </div>
+            <div style="display:flex;gap:8px">
+              <button class="btn btn-secondary btn-sm" onclick="toggleAllChannels()">Toggle All</button>
+            </div>
+          </div>
+          <div class="chart-container" id="main-chart" style="position:relative"></div>
+        </div>
+      </div>
+
+      <!-- Anomaly results -->
+      <div id="anomaly-section" style="display:none" class="fade-in">
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">
+              <span class="dot" style="background:var(--accent-4);box-shadow:0 0 8px var(--accent-4)"></span>
+              <span>Detected Anomalies</span>
+              <span class="badge badge-anomaly" id="anomaly-count-badge">0</span>
+            </div>
+            <div style="display:flex;gap:8px">
+              <button class="btn btn-secondary btn-sm" onclick="confirmAll()">✅ Confirm All</button>
+              <button class="btn btn-secondary btn-sm" onclick="rejectAll()">❌ Reject All</button>
+            </div>
+          </div>
+          <div class="anomaly-table-wrap">
+            <table class="anomaly-table" id="anomaly-table">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Timestamp</th>
+                  <th>Value</th>
+                  <th>Score</th>
+                  <th>Human Label</th>
+                  <th>Note</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="anomaly-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+    </main>
+  </div>
+
+  <!-- Toast container -->
+  <div class="toast-container" id="toast-container"></div>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>
