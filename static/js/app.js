@@ -14,7 +14,11 @@ const state = {
   channelNames: [],
   selectedChannel: null,
   anomalyResult: null,
-  feedback: {},       // index -> { label, note }
+  lstmResult: null,
+  compareResult: null,
+  ciVisible: false,
+  currentMode: 'classical',
+  feedback: {},
   allChannelsVisible: true,
 };
 
@@ -97,10 +101,16 @@ async function selectFile(experiment, filename) {
     state.channelNames = data.channel_names;
     state.fileKey = data.file_key;
 
-    // Populate channel selector
-    const sel = document.getElementById("select-channel");
-    sel.innerHTML = state.channelNames.map(c => `<option value="${c}">${c}</option>`).join('');
+    // Populate channel selectors
+    const opts = state.channelNames.map(c => `<option value="${c}">${c}</option>`).join('');
+    document.getElementById("select-channel").innerHTML = opts;
+    document.getElementById("select-channel-compare").innerHTML = opts;
     state.selectedChannel = state.channelNames[0];
+    state.lstmResult = null;
+    state.compareResult = null;
+    state.ciVisible = false;
+    document.getElementById("ci-toggle").checked = false;
+    document.getElementById("ci-params").style.display = "none";
 
     // Show sections
     document.getElementById("empty-state").style.display = "none";
@@ -108,6 +118,8 @@ async function selectFile(experiment, filename) {
     document.getElementById("chart-section").style.display = "block";
     document.getElementById("algo-section").style.display = "block";
     document.getElementById("anomaly-section").style.display = "none";
+    document.getElementById("lstm-error-section").style.display = "none";
+    document.getElementById("compare-section").style.display = "none";
     document.getElementById("btn-export").style.display = "none";
 
     await loadStats();
@@ -174,60 +186,8 @@ const CHANNEL_COLORS = [
   '#a78bfa', '#22d3ee', '#fb7185', '#34d399',
 ];
 
-function renderChart() {
-  const traces = state.channelNames.map((ch, i) => ({
-    x: state.timestamps,
-    y: state.channels[ch],
-    name: ch,
-    type: 'scattergl',
-    mode: 'lines',
-    line: { color: CHANNEL_COLORS[i % CHANNEL_COLORS.length], width: 1.5 },
-    connectgaps: false,
-  }));
+// renderChart – defined below, supports CI bands, LSTM overlay, comparison overlay
 
-  // If anomalies exist, overlay them
-  if (state.anomalyResult) {
-    const ar = state.anomalyResult;
-    traces.push({
-      x: ar.anomaly_timestamps,
-      y: ar.anomaly_values,
-      name: `Anomalies (${ar.algorithm})`,
-      type: 'scattergl',
-      mode: 'markers',
-      marker: {
-        color: '#f43f5e',
-        size: 8,
-        symbol: 'diamond',
-        line: { color: '#fff', width: 1 },
-      },
-    });
-  }
-
-  const layout = {
-    paper_bgcolor: 'rgba(0,0,0,0)',
-    plot_bgcolor: 'rgba(13,20,37,0.8)',
-    font: { family: 'Inter', color: '#8b95b0', size: 12 },
-    margin: { t: 30, r: 30, b: 50, l: 60 },
-    xaxis: {
-      gridcolor: 'rgba(99,130,255,0.08)',
-      title: 'Time',
-    },
-    yaxis: {
-      gridcolor: 'rgba(99,130,255,0.08)',
-      title: 'Value',
-    },
-    legend: {
-      bgcolor: 'rgba(0,0,0,0)',
-      font: { size: 11 },
-    },
-    hovermode: 'x unified',
-  };
-
-  Plotly.react('main-chart', traces, layout, { responsive: true });
-
-  document.getElementById("chart-title").textContent =
-    `${state.currentExperiment} / ${state.currentFile}`;
-}
 
 function toggleAllChannels() {
   state.allChannelsVisible = !state.allChannelsVisible;
@@ -545,3 +505,305 @@ async function exportAnnotated() {
     toast("Export failed", "error");
   }
 }
+
+// ── Mode switching ──
+function setMode(mode) {
+  state.currentMode = mode;
+  ['classical','lstm','compare'].forEach(m => {
+    document.getElementById(`tab-${m}`).classList.toggle('active', m === mode);
+    document.getElementById(`panel-${m}`).style.display = m === mode ? 'block' : 'none';
+  });
+}
+
+// ── Confidence Interval ──
+function toggleCI() {
+  state.ciVisible = document.getElementById("ci-toggle").checked;
+  document.getElementById("ci-params").style.display = state.ciVisible ? "block" : "none";
+  if (state.ciVisible && state.currentFile) fetchAndRenderCI();
+  else renderChart(); // redraw without CI bands
+}
+
+async function fetchAndRenderCI() {
+  const channel = document.getElementById("select-channel").value;
+  const nSigma  = parseFloat(document.getElementById("ci-sigma").value);
+  const data = await api("/api/confidence_interval", {
+    experiment: state.currentExperiment,
+    filename: state.currentFile,
+    channel,
+    window: 20,
+    n_sigma: nSigma,
+  });
+  if (data.error) { toast(data.error, "error"); return; }
+  state._ciData = data;
+  renderChart();
+}
+
+// ── Comprehensive renderChart (CI + Classical + Compare + LSTM overlays) ──
+function renderChart() {
+  const traces = state.channelNames.map((ch, i) => ({
+    x: state.timestamps,
+    y: state.channels[ch],
+    name: ch,
+    type: 'scattergl',
+    mode: 'lines',
+    line: { color: CHANNEL_COLORS[i % CHANNEL_COLORS.length], width: 1.5 },
+    connectgaps: false,
+  }));
+
+  // CI bands for selected channel
+  if (state.ciVisible && state._ciData) {
+    const ci = state._ciData;
+    traces.push({
+      x: [...state.timestamps, ...state.timestamps.slice().reverse()],
+      y: [...ci.upper, ...ci.lower.slice().reverse()],
+      fill: 'toself',
+      fillcolor: 'rgba(99,102,241,0.08)',
+      line: { color: 'transparent' },
+      name: `CI ±${ci.n_sigma}σ`,
+      type: 'scatter',
+      hoverinfo: 'skip',
+    });
+    traces.push({
+      x: state.timestamps, y: ci.mean,
+      name: 'Rolling Mean',
+      type: 'scattergl', mode: 'lines',
+      line: { color: 'rgba(99,102,241,0.5)', width: 1, dash: 'dot' },
+    });
+  }
+
+  // Classical anomaly overlay
+  if (state.anomalyResult && state.currentMode === 'classical') {
+    const ar = state.anomalyResult;
+    traces.push({
+      x: ar.anomaly_timestamps, y: ar.anomaly_values,
+      name: `Anomalies (${ar.algorithm})`,
+      type: 'scattergl', mode: 'markers',
+      marker: { color: '#f43f5e', size: 8, symbol: 'diamond', line: { color: '#fff', width: 1 } },
+    });
+  }
+
+  // Compare consensus overlay
+  if (state.compareResult && state.currentMode === 'compare') {
+    const cr = state.compareResult;
+    traces.push({
+      x: cr.consensus_timestamps, y: cr.consensus_values,
+      name: 'Consensus Anomalies',
+      type: 'scattergl', mode: 'markers',
+      marker: { color: '#06b6d4', size: 10, symbol: 'diamond', line: { color: '#fff', width: 1 } },
+    });
+  }
+
+  const layout = {
+    paper_bgcolor: 'rgba(0,0,0,0)',
+    plot_bgcolor: 'rgba(13,20,37,0.8)',
+    font: { family: 'Inter', color: '#8b95b0', size: 12 },
+    margin: { t: 30, r: 30, b: 50, l: 60 },
+    xaxis: { gridcolor: 'rgba(99,130,255,0.08)', title: 'Time' },
+    yaxis: { gridcolor: 'rgba(99,130,255,0.08)', title: 'Value' },
+    legend: { bgcolor: 'rgba(0,0,0,0)', font: { size: 11 } },
+    hovermode: 'x unified',
+  };
+
+  Plotly.react('main-chart', traces, layout, { responsive: true });
+  document.getElementById("chart-title").textContent =
+    `${state.currentExperiment} / ${state.currentFile}`;
+}
+
+// ── LSTM Detection ──
+async function runLSTM() {
+  if (!state.currentFile) { toast("Load a file first", "error"); return; }
+
+  const contamination = parseFloat(document.getElementById("lstm-contamination").value);
+  const epochs        = parseInt(document.getElementById("lstm-epochs").value);
+  const time_steps    = parseInt(document.getElementById("lstm-timesteps").value);
+
+  toast(`Training LSTM (${epochs} epochs)… this may take a moment`, "info");
+
+  try {
+    const data = await api("/api/detect_lstm", {
+      experiment: state.currentExperiment,
+      filename: state.currentFile,
+      contamination, epochs, time_steps,
+    });
+
+    if (data.error) { toast(data.error, "error"); return; }
+    state.lstmResult = data;
+    renderLSTMResults(data);
+    toast(`LSTM: ${data.anomaly_count} anomalies detected (threshold MAE: ${data.threshold.toFixed(4)})`, "success");
+  } catch (e) {
+    toast("LSTM detection failed", "error");
+    console.error(e);
+  }
+}
+
+function renderLSTMResults(data) {
+  // Update threshold badge
+  document.getElementById("lstm-threshold-badge").textContent =
+    `Threshold: ${data.threshold.toFixed(4)}`;
+
+  // Reconstruction error chart
+  const maeX = data.all_mae.map(d => d.timestamp);
+  const maeY = data.all_mae.map(d => d.mae);
+  const anomalyMask = data.anomaly_indices;
+  const anomalyMaeX = data.anomaly_timestamps;
+  const anomalyMaeY = data.anomaly_scores;
+
+  Plotly.react('lstm-error-chart', [
+    {
+      x: maeX, y: maeY,
+      name: 'Reconstruction MAE', type: 'scattergl', mode: 'lines',
+      line: { color: '#8b5cf6', width: 1.5 },
+    },
+    {
+      x: [maeX[0], maeX[maeX.length-1]],
+      y: [data.threshold, data.threshold],
+      name: 'Threshold', type: 'scatter', mode: 'lines',
+      line: { color: '#f43f5e', width: 1.5, dash: 'dash' },
+    },
+    {
+      x: anomalyMaeX, y: anomalyMaeY,
+      name: 'Anomalies', type: 'scattergl', mode: 'markers',
+      marker: { color: '#f43f5e', size: 8, symbol: 'diamond', line: { color: '#fff', width: 1 } },
+    },
+  ], {
+    paper_bgcolor: 'rgba(0,0,0,0)',
+    plot_bgcolor: 'rgba(13,20,37,0.8)',
+    font: { family: 'Inter', color: '#8b95b0', size: 12 },
+    margin: { t: 20, r: 30, b: 50, l: 60 },
+    xaxis: { gridcolor: 'rgba(99,130,255,0.08)', title: 'Time' },
+    yaxis: { gridcolor: 'rgba(99,130,255,0.08)', title: 'MAE Loss' },
+    hovermode: 'x unified',
+    legend: { bgcolor: 'rgba(0,0,0,0)' },
+  }, { responsive: true });
+
+  document.getElementById("lstm-error-section").style.display = "block";
+
+  // Anomaly table
+  const tbody = document.getElementById("anomaly-tbody");
+  document.getElementById("anomaly-count-badge").textContent = data.anomaly_count;
+
+  // Pick first channel for value display
+  const firstCh = data.channels[0];
+  const chVals  = firstCh ? data.per_channel_values[firstCh] : [];
+
+  tbody.innerHTML = data.anomaly_indices.map((idx, i) => {
+    const conf = data.anomaly_confidences[i];
+    const val  = chVals[i];
+    return `
+      <tr id="anomaly-row-${idx}">
+        <td>${i+1}</td>
+        <td style="font-size:12px">${data.anomaly_timestamps[i]}</td>
+        <td><strong>${val != null ? val.toFixed(4) : 'N/A'}</strong>
+          <span class="badge badge-lstm" style="margin-left:4px">${conf.toFixed(1)}%</span>
+        </td>
+        <td>${data.anomaly_scores[i].toFixed(4)}</td>
+        <td><span class="badge" id="label-${idx}">unlabeled</span></td>
+        <td><input type="text" placeholder="Add note…" style="width:120px;padding:4px 8px;font-size:11px"
+            onchange="setFeedbackNote(${idx}, this.value)" id="note-${idx}"></td>
+        <td>
+          <div class="feedback-btns">
+            <button class="fb-btn" onclick="setFeedback(${idx},'anomaly')">✓ Anomaly</button>
+            <button class="fb-btn" onclick="setFeedback(${idx},'normal')">✗ Normal</button>
+          </div>
+        </td>
+      </tr>`;
+  }).join('');
+
+  document.getElementById("anomaly-section").style.display = "block";
+  document.getElementById("feedback-section").style.display = "block";
+  document.getElementById("btn-export").style.display = "inline-flex";
+  state.anomalyResult = {
+    algorithm: "lstm_autoencoder",
+    anomaly_count: data.anomaly_count,
+    anomaly_indices: data.anomaly_indices,
+    anomaly_values: data.anomaly_indices.map((_, i) => chVals[i]),
+    anomaly_timestamps: data.anomaly_timestamps,
+  };
+  updateFeedbackSummary();
+}
+
+// ── Algorithm Comparison ──
+async function runCompare() {
+  if (!state.currentFile) { toast("Load a file first", "error"); return; }
+
+  const channel = document.getElementById("select-channel-compare").value;
+  toast(`Running all algorithms on ${channel}…`, "info");
+
+  try {
+    const data = await api("/api/compare", {
+      experiment: state.currentExperiment,
+      filename: state.currentFile,
+      channel,
+    });
+    if (data.error) { toast(data.error, "error"); return; }
+    state.compareResult = data;
+    state.selectedChannel = channel;
+    renderCompareResults(data, channel);
+    toast(`Consensus: ${data.consensus_count} anomalies agreed by ≥2 algorithms`, "success");
+  } catch (e) {
+    toast("Comparison failed", "error");
+    console.error(e);
+  }
+}
+
+function renderCompareResults(data, channel) {
+  const ALGO_LABELS = {
+    zscore: 'Z-Score', iqr: 'IQR',
+    isolation_forest: 'Iso. Forest', lof: 'LOF', rolling_stats: 'Rolling',
+  };
+
+  // Summary cards
+  const grid = document.getElementById("compare-grid");
+  const cards = Object.entries(data.per_algorithm).map(([name, res]) => `
+    <div class="compare-card">
+      <div class="cc-name">${ALGO_LABELS[name] || name}</div>
+      <div class="cc-count">${res.anomaly_count}</div>
+    </div>`).join('');
+  grid.innerHTML = cards + `
+    <div class="compare-card consensus">
+      <div class="cc-name">Consensus ≥2</div>
+      <div class="cc-count">${data.consensus_count}</div>
+    </div>`;
+
+  // Heatmap-style vote chart: vote_counts bar
+  const allAlgos = Object.keys(data.per_algorithm);
+  const traceData = [];
+
+  // One trace per algorithm (scatter showing their anomaly positions)
+  allAlgos.forEach((name, i) => {
+    const indices = data.per_algorithm[name].anomaly_indices;
+    traceData.push({
+      x: indices.map(idx => state.timestamps[idx]),
+      y: Array(indices.length).fill(ALGO_LABELS[name] || name),
+      mode: 'markers',
+      type: 'scatter',
+      name: ALGO_LABELS[name] || name,
+      marker: { size: 8, symbol: 'line-ns', line: { width: 2 } },
+    });
+  });
+
+  // Consensus
+  traceData.push({
+    x: data.consensus_timestamps,
+    y: Array(data.consensus_count).fill('Consensus'),
+    mode: 'markers', type: 'scatter',
+    name: 'Consensus',
+    marker: { color: '#06b6d4', size: 10, symbol: 'diamond' },
+  });
+
+  Plotly.react('compare-chart', traceData, {
+    paper_bgcolor: 'rgba(0,0,0,0)',
+    plot_bgcolor: 'rgba(13,20,37,0.8)',
+    font: { family: 'Inter', color: '#8b95b0', size: 12 },
+    margin: { t: 20, r: 30, b: 60, l: 120 },
+    xaxis: { gridcolor: 'rgba(99,130,255,0.08)', title: 'Time' },
+    yaxis: { gridcolor: 'rgba(99,130,255,0.08)' },
+    legend: { bgcolor: 'rgba(0,0,0,0)' },
+    height: 280,
+    title: { text: `Algorithm Comparison – ${channel}`, font: { size: 13 } },
+  }, { responsive: true });
+
+  document.getElementById("compare-section").style.display = "block";
+  renderChart(); // overlay consensus on main chart
+}
+

@@ -5,6 +5,10 @@ Provides APIs for:
   - Listing & loading experiment data from uploads/
   - Uploading new CSV files
   - Running unsupervised anomaly detection (Z-Score, IQR, Isolation Forest, LOF, Rolling Stats)
+  - LSTM Autoencoder deep anomaly detection (train-on-the-fly, PyTorch)
+  - Confidence interval bands per channel
+  - Multi-algorithm comparison / consensus scoring
+  - Complete pipeline integration
   - Human-in-the-loop feedback for anomaly labels
   - Exporting annotated data
 """
@@ -20,8 +24,18 @@ import pandas as pd
 from scipy import stats as scipy_stats
 from sklearn.ensemble import IsolationForest
 from sklearn.neighbors import LocalOutlierFactor
+from sklearn.preprocessing import StandardScaler
 from flask import Flask, render_template, request, jsonify, send_file
 from flask_cors import CORS
+
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.utils.data import TensorDataset, DataLoader
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
 
 app = Flask(__name__)
 CORS(app)
@@ -494,5 +508,255 @@ def get_stats():
     })
 
 
+# ---------------------------------------------------------------------------
+# LSTM Autoencoder (PyTorch) – train-on-the-fly
+# ---------------------------------------------------------------------------
+
+class _LSTMAutoencoder(nn.Module if TORCH_AVAILABLE else object):
+    def __init__(self, num_features):
+        if not TORCH_AVAILABLE:
+            return
+        super().__init__()
+        self.hidden_size = min(64, max(16, num_features * 4))
+        self.encoder = nn.LSTM(num_features, self.hidden_size, batch_first=True)
+        self.decoder = nn.LSTM(self.hidden_size, self.hidden_size, batch_first=True)
+        self.out = nn.Linear(self.hidden_size, num_features)
+
+    def forward(self, x):
+        _, (h, _) = self.encoder(x)
+        rep = h[-1].unsqueeze(1).repeat(1, x.size(1), 1)
+        dec, _ = self.decoder(rep)
+        return self.out(dec)
+
+
+def _run_lstm(series_df, sensor_cols, time_steps=10, epochs=30, contamination=0.03):
+    """Train LSTM autoencoder on-the-fly and return per-sequence MAE + anomaly flags."""
+    scaler = StandardScaler()
+    scaled = pd.DataFrame(scaler.fit_transform(series_df[sensor_cols]), columns=sensor_cols)
+
+    # Build sequences
+    Xs = []
+    for i in range(len(scaled) - time_steps):
+        Xs.append(scaled.iloc[i:i + time_steps].values)
+    if len(Xs) < 10:
+        raise ValueError("Not enough data points for LSTM (need > time_steps+10)")
+
+    X_np = np.array(Xs, dtype=np.float32)
+    X_t = torch.tensor(X_np)
+
+    loader = DataLoader(TensorDataset(X_t), batch_size=32, shuffle=False)
+    model = _LSTMAutoencoder(len(sensor_cols))
+    criterion = nn.L1Loss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+    model.train()
+    for _ in range(epochs):
+        for (batch,) in loader:
+            optimizer.zero_grad()
+            loss = criterion(model(batch), batch)
+            loss.backward()
+            optimizer.step()
+
+    model.eval()
+    with torch.no_grad():
+        recon = model(X_t).numpy()
+
+    mae = np.mean(np.abs(recon - X_np), axis=(1, 2))
+    threshold = np.percentile(mae, (1 - contamination) * 100)
+    max_mae = mae.max()
+
+    def confidence(v):
+        if v <= threshold or max_mae == threshold:
+            return 0.0
+        return min(100.0, 50.0 + (v - threshold) / (max_mae - threshold) * 50.0)
+
+    flags = mae > threshold
+    scores = mae.tolist()
+    confs = [confidence(v) for v in mae]
+    # sequence index maps to the last timestep in the window
+    seq_indices = list(range(time_steps - 1, time_steps - 1 + len(mae)))
+    return flags, scores, confs, seq_indices, float(threshold)
+
+
+# ---------------------------------------------------------------------------
+# New Routes
+# ---------------------------------------------------------------------------
+
+@app.route("/api/detect_lstm", methods=["POST"])
+def detect_lstm():
+    """Train LSTM Autoencoder on the fly and return anomaly results."""
+    if not TORCH_AVAILABLE:
+        return jsonify({"error": "PyTorch not installed on server"}), 500
+
+    body = request.json
+    experiment = body.get("experiment", "")
+    filename = body.get("filename", "")
+    contamination = float(body.get("contamination", 0.03))
+    time_steps = int(body.get("time_steps", 10))
+    epochs = int(body.get("epochs", 30))
+
+    filepath = os.path.join(UPLOAD_FOLDER, experiment, filename)
+    if not os.path.exists(filepath):
+        return jsonify({"error": "File not found"}), 404
+
+    try:
+        df, ch_cols = load_file(filepath)
+    except Exception as e:
+        return jsonify({"error": f"Parse error: {str(e)}"}), 400
+
+    if not ch_cols:
+        return jsonify({"error": "No sensor channels found"}), 400
+
+    # Fill NaN for LSTM (forward-fill then back-fill)
+    df[ch_cols] = df[ch_cols].fillna(method="ffill").fillna(method="bfill")
+
+    try:
+        flags, scores, confs, seq_indices, threshold = _run_lstm(
+            df, ch_cols, time_steps=time_steps, epochs=epochs, contamination=contamination
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    timestamps = df["timestamp"].astype(str).tolist() if "timestamp" in df.columns else list(range(len(df)))
+
+    anomaly_indices = [seq_indices[i] for i, f in enumerate(flags) if f]
+    anomaly_scores  = [scores[i] for i, f in enumerate(flags) if f]
+    anomaly_confs   = [confs[i] for i, f in enumerate(flags) if f]
+    anomaly_ts      = [timestamps[idx] for idx in anomaly_indices]
+
+    # Per-channel anomaly values at flagged indices
+    per_channel_values = {}
+    for col in ch_cols:
+        vals = df[col].tolist()
+        per_channel_values[col] = [
+            (None if (isinstance(vals[idx], float) and np.isnan(vals[idx])) else vals[idx])
+            for idx in anomaly_indices
+        ]
+
+    # All sequence MAE scores (for the reconstruction error chart)
+    all_mae = [{"index": seq_indices[i], "timestamp": timestamps[seq_indices[i]], "mae": scores[i], "confidence": confs[i]}
+               for i in range(len(scores))]
+
+    return jsonify({
+        "algorithm": "lstm_autoencoder",
+        "channels": ch_cols,
+        "total_points": len(df),
+        "time_steps": time_steps,
+        "threshold": threshold,
+        "anomaly_count": len(anomaly_indices),
+        "anomaly_indices": anomaly_indices,
+        "anomaly_scores": anomaly_scores,
+        "anomaly_confidences": anomaly_confs,
+        "anomaly_timestamps": anomaly_ts,
+        "per_channel_values": per_channel_values,
+        "all_mae": all_mae,
+    })
+
+
+@app.route("/api/confidence_interval", methods=["POST"])
+def confidence_interval():
+    """Return rolling mean, upper CI, and lower CI bands for a channel."""
+    body = request.json
+    experiment = body.get("experiment", "")
+    filename = body.get("filename", "")
+    channel = body.get("channel", "")
+    window = int(body.get("window", 20))
+    n_sigma = float(body.get("n_sigma", 2.0))
+
+    filepath = os.path.join(UPLOAD_FOLDER, experiment, filename)
+    if not os.path.exists(filepath):
+        return jsonify({"error": "File not found"}), 404
+
+    df, ch_cols = load_file(filepath)
+    if channel not in ch_cols:
+        return jsonify({"error": "Channel not found"}), 400
+
+    series = df[channel].copy()
+    roll_mean = series.rolling(window=window, center=True, min_periods=1).mean()
+    roll_std  = series.rolling(window=window, center=True, min_periods=1).std().fillna(0)
+
+    upper = (roll_mean + n_sigma * roll_std).tolist()
+    lower = (roll_mean - n_sigma * roll_std).tolist()
+    mean  = roll_mean.tolist()
+
+    def clean(lst):
+        return [None if (isinstance(v, float) and np.isnan(v)) else v for v in lst]
+
+    return jsonify({
+        "channel": channel,
+        "window": window,
+        "n_sigma": n_sigma,
+        "mean": clean(mean),
+        "upper": clean(upper),
+        "lower": clean(lower),
+    })
+
+
+@app.route("/api/compare", methods=["POST"])
+def compare_algorithms():
+    """Run all 5 classical algorithms on a channel and return consensus results."""
+    body = request.json
+    experiment = body.get("experiment", "")
+    filename = body.get("filename", "")
+    channel = body.get("channel", "")
+
+    filepath = os.path.join(UPLOAD_FOLDER, experiment, filename)
+    if not os.path.exists(filepath):
+        return jsonify({"error": "File not found"}), 404
+
+    try:
+        df, ch_cols = load_file(filepath)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+    if channel not in ch_cols:
+        return jsonify({"error": "Channel not found"}), 400
+
+    series = df[channel].copy()
+    timestamps = df["timestamp"].astype(str).tolist() if "timestamp" in df.columns else list(range(len(df)))
+
+    results = {}
+    vote_matrix = np.zeros(len(series), dtype=int)
+
+    algo_configs = {
+        "zscore":           (detect_zscore,           {}),
+        "iqr":              (detect_iqr,               {}),
+        "isolation_forest": (detect_isolation_forest,  {}),
+        "lof":              (detect_lof,               {}),
+        "rolling_stats":    (detect_rolling_stats,     {}),
+    }
+
+    for name, (fn, kwargs) in algo_configs.items():
+        try:
+            mask, scores = fn(series, **kwargs)
+            vote_matrix += mask.astype(int)
+            results[name] = {
+                "anomaly_count": int(mask.sum()),
+                "anomaly_indices": np.where(mask)[0].tolist(),
+            }
+        except Exception:
+            results[name] = {"anomaly_count": 0, "anomaly_indices": []}
+
+    # Consensus: flagged by ≥ 2 algorithms
+    consensus_mask = vote_matrix >= 2
+    consensus_indices = np.where(consensus_mask)[0].tolist()
+    vote_counts = vote_matrix.tolist()
+
+    consensus_values = series.iloc[consensus_indices].tolist()
+    consensus_ts     = [timestamps[i] for i in consensus_indices]
+
+    return jsonify({
+        "channel": channel,
+        "total_points": len(series),
+        "per_algorithm": results,
+        "vote_counts": vote_counts,
+        "consensus_indices": consensus_indices,
+        "consensus_values": [None if (isinstance(v, float) and np.isnan(v)) else v for v in consensus_values],
+        "consensus_timestamps": consensus_ts,
+        "consensus_count": len(consensus_indices),
+    })
+
+
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
+

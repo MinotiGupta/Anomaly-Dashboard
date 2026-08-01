@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="Anomaly Detection Dashboard – Upload, visualize, and detect anomalies in experimental time-series data with human-in-the-loop feedback.">
+  <meta name="description" content="AnomalyScope – Upload, visualize, and detect anomalies in experimental time-series data using classical statistics, LSTM Autoencoder, and multi-algorithm consensus.">
   <title>AnomalyScope – Anomaly Detection Dashboard</title>
   <link rel="stylesheet" href="/static/css/style.css">
   <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
@@ -57,30 +57,96 @@
         <input type="file" id="file-input-sidebar" accept=".csv" style="display:none" onchange="handleUploadSidebar(this)">
       </div>
 
-      <!-- Algorithm Config -->
+      <!-- Mode Tabs -->
       <div class="sidebar-section" id="algo-section" style="display:none">
-        <h3>Detection Algorithm</h3>
-        <div class="form-group">
-          <label for="select-channel">Channel</label>
-          <select id="select-channel"></select>
-        </div>
-        <div class="form-group">
-          <label for="select-algo">Algorithm</label>
-          <select id="select-algo" onchange="updateAlgoParams()">
-            <option value="zscore">Z-Score</option>
-            <option value="iqr">IQR (Interquartile Range)</option>
-            <option value="isolation_forest">Isolation Forest</option>
-            <option value="lof">Local Outlier Factor</option>
-            <option value="rolling_stats" selected>Rolling Statistics</option>
-          </select>
+        <h3>Detection Mode</h3>
+        <div class="mode-tabs">
+          <button class="mode-tab active" id="tab-classical" onclick="setMode('classical')">⚡ Classical</button>
+          <button class="mode-tab" id="tab-lstm" onclick="setMode('lstm')">🧠 LSTM</button>
+          <button class="mode-tab" id="tab-compare" onclick="setMode('compare')">📊 Compare</button>
         </div>
 
-        <!-- Dynamic algo params -->
-        <div id="algo-params" class="algo-params"></div>
+        <!-- Classical Panel -->
+        <div id="panel-classical">
+          <div class="form-group" style="margin-top:12px">
+            <label for="select-channel">Channel</label>
+            <select id="select-channel"></select>
+          </div>
+          <div class="form-group">
+            <label for="select-algo">Algorithm</label>
+            <select id="select-algo" onchange="updateAlgoParams()">
+              <option value="zscore">Z-Score</option>
+              <option value="iqr">IQR (Interquartile Range)</option>
+              <option value="isolation_forest">Isolation Forest</option>
+              <option value="lof">Local Outlier Factor</option>
+              <option value="rolling_stats" selected>Rolling Statistics</option>
+            </select>
+          </div>
+          <div id="algo-params" class="algo-params"></div>
 
-        <button class="btn btn-primary" style="width:100%;margin-top:8px" onclick="runDetection()">
-          🔍 Detect Anomalies
-        </button>
+          <!-- CI Toggle -->
+          <div class="ci-toggle-row">
+            <label class="toggle-label">
+              <input type="checkbox" id="ci-toggle" onchange="toggleCI()">
+              <span class="toggle-switch"></span>
+              Show Confidence Interval
+            </label>
+            <div id="ci-params" style="display:none; margin-top:8px">
+              <div class="param-row">
+                <label>σ Band</label>
+                <input type="range" id="ci-sigma" min="1" max="4" step="0.5" value="2"
+                  oninput="document.getElementById('ci-sigma-val').textContent=this.value">
+                <span class="param-val" id="ci-sigma-val">2</span>
+              </div>
+            </div>
+          </div>
+
+          <button class="btn btn-primary" style="width:100%;margin-top:8px" onclick="runDetection()">
+            🔍 Detect Anomalies
+          </button>
+        </div>
+
+        <!-- LSTM Panel -->
+        <div id="panel-lstm" style="display:none">
+          <div class="form-group" style="margin-top:12px">
+            <label>Trains on ALL channels simultaneously</label>
+            <p class="algo-hint">The LSTM Autoencoder learns normal multi-channel patterns. Points it cannot reconstruct are flagged as anomalies.</p>
+          </div>
+          <div class="param-row">
+            <label>Contamination</label>
+            <input type="range" id="lstm-contamination" min="0.01" max="0.2" step="0.01" value="0.03"
+              oninput="document.getElementById('lstm-contamination-val').textContent=this.value">
+            <span class="param-val" id="lstm-contamination-val">0.03</span>
+          </div>
+          <div class="param-row">
+            <label>Epochs</label>
+            <input type="range" id="lstm-epochs" min="10" max="80" step="10" value="30"
+              oninput="document.getElementById('lstm-epochs-val').textContent=this.value">
+            <span class="param-val" id="lstm-epochs-val">30</span>
+          </div>
+          <div class="param-row">
+            <label>Window</label>
+            <input type="range" id="lstm-timesteps" min="5" max="30" step="5" value="10"
+              oninput="document.getElementById('lstm-timesteps-val').textContent=this.value">
+            <span class="param-val" id="lstm-timesteps-val">10</span>
+          </div>
+          <button class="btn btn-primary" style="width:100%;margin-top:12px" onclick="runLSTM()">
+            🧠 Run LSTM Detection
+          </button>
+          <p class="algo-hint" style="margin-top:6px">Training may take 15–60 seconds depending on data size.</p>
+        </div>
+
+        <!-- Compare Panel -->
+        <div id="panel-compare" style="display:none">
+          <div class="form-group" style="margin-top:12px">
+            <label for="select-channel-compare">Channel</label>
+            <select id="select-channel-compare"></select>
+          </div>
+          <p class="algo-hint">Runs all 5 classical algorithms and flags points detected by ≥ 2 algorithms as consensus anomalies.</p>
+          <button class="btn btn-primary" style="width:100%;margin-top:12px" onclick="runCompare()">
+            📊 Run All & Compare
+          </button>
+        </div>
       </div>
 
       <!-- Feedback Summary -->
@@ -127,6 +193,34 @@
         </div>
       </div>
 
+      <!-- LSTM Reconstruction Error chart -->
+      <div id="lstm-error-section" style="display:none" class="fade-in">
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">
+              <span class="dot" style="background:var(--accent-2);box-shadow:0 0 8px var(--accent-2)"></span>
+              <span>LSTM Reconstruction Error (MAE)</span>
+              <span class="badge badge-lstm" id="lstm-threshold-badge"></span>
+            </div>
+          </div>
+          <div class="chart-container" id="lstm-error-chart"></div>
+        </div>
+      </div>
+
+      <!-- Comparison chart -->
+      <div id="compare-section" style="display:none" class="fade-in">
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">
+              <span class="dot" style="background:var(--accent-3);box-shadow:0 0 8px var(--accent-3)"></span>
+              <span>Algorithm Comparison</span>
+            </div>
+          </div>
+          <div class="compare-grid" id="compare-grid"></div>
+          <div class="chart-container" id="compare-chart" style="margin-top:16px"></div>
+        </div>
+      </div>
+
       <!-- Anomaly results -->
       <div id="anomaly-section" style="display:none" class="fade-in">
         <div class="card">
@@ -147,7 +241,7 @@
                 <tr>
                   <th>#</th>
                   <th>Timestamp</th>
-                  <th>Value</th>
+                  <th>Value / Confidence</th>
                   <th>Score</th>
                   <th>Human Label</th>
                   <th>Note</th>
