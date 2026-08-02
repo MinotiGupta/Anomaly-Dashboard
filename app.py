@@ -1,22 +1,20 @@
 """
 Anomaly Detection Dashboard - Flask Backend
 =============================================
-Provides APIs for:
-  - Listing & loading experiment data from uploads/
-  - Uploading new CSV files
-  - Running unsupervised anomaly detection (Z-Score, IQR, Isolation Forest, LOF, Rolling Stats)
-  - LSTM Autoencoder deep anomaly detection (train-on-the-fly, PyTorch)
-  - Confidence interval bands per channel
-  - Multi-algorithm comparison / consensus scoring
-  - Complete pipeline integration
-  - Human-in-the-loop feedback for anomaly labels
-  - Exporting annotated data
+Architecture: Task-Queue Pattern
+  Browser  →  POST /api/run_lstm  →  spawns background thread  →  returns {task_id}
+  Browser  →  polls GET /api/task/{id} every 2 s  →  {status, progress, results}
+  Thread   →  trains LSTM  →  writes results to TASKS store  →  marks DONE
+
+This mirrors how Celery+Redis works in production ML systems, implemented
+using Python's threading module so no extra infrastructure is needed.
 """
 
 import os
 import json
 import uuid
 import io
+import threading
 from datetime import datetime
 
 import numpy as np
@@ -46,6 +44,21 @@ FEEDBACK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feedba
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # ---------------------------------------------------------------------------
+# Task store  –  the in-memory job registry
+# ---------------------------------------------------------------------------
+# Each task looks like:
+#   TASKS[task_id] = {
+#     "status":   "pending" | "training" | "evaluating" | "done" | "error",
+#     "progress": 0-100,          # epoch % during training
+#     "message":  str,            # human-readable status line
+#     "result":   dict | None,    # full result payload when done
+#     "error":    str | None,
+#     "created":  ISO timestamp
+#   }
+TASKS: dict = {}
+TASKS_LOCK = threading.Lock()      # guards concurrent reads/writes
+
+# ---------------------------------------------------------------------------
 # Feedback persistence
 # ---------------------------------------------------------------------------
 
@@ -69,11 +82,10 @@ def save_feedback(data):
 
 def parse_cleaned_csv(filepath):
     """
-    Parse a '_cleaned.csv' file that has columns:
+    Parse a '_cleaned.csv' file with columns:
     timestamp, scan_number, ch_00 [, ch_01 …], system_file, system_id
     """
-    df = pd.read_csv(filepath)
-    # Identify channel columns
+    df = pd.read_csv(filepath, encoding="utf-8", encoding_errors="replace")
     ch_cols = [c for c in df.columns if c.startswith("ch_")]
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     return df, ch_cols
@@ -81,36 +93,48 @@ def parse_cleaned_csv(filepath):
 
 def parse_raw_instrument_csv(filepath):
     """
-    Parse a raw DAQ instrument CSV export.
-    The data section starts after a row whose first cell contains 'Scan Sweep Time'.
+    Parse a raw DAQ instrument CSV (Cataluminescence, Biomass, Swiss, Default formats).
+    Header detection uses the same keywords as the individual LSTM notebooks:
+      'Scan Num', '101 (', 'Scan Swee', 'timestamp'
+    Sentinel values (-9.9E+37) and hardware overloads (>10 000) are scrubbed to NaN.
     """
-    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-        lines = f.readlines()
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except Exception as e:
+        raise ValueError(f"Cannot read file: {e}")
 
+    # ── Step 1: find the header row ──
+    # Matches the notebook pattern: any keyword in the header line
+    HEADER_KEYWORDS = ["Scan Num", "101 (", "Scan Swee", "timestamp", "Scan Number", "Scan Sweep"]
     data_start = None
     for i, line in enumerate(lines):
-        if "Scan Sweep Time" in line or "Scan Number" in line:
+        if any(kw in line for kw in HEADER_KEYWORDS):
             data_start = i
             break
 
     if data_start is None:
-        # Fallback: try to read as plain CSV
-        df = pd.read_csv(filepath)
-        ch_cols = [c for c in df.columns if c not in ("timestamp", "scan_number", "system_file", "system_id")]
-        return df, ch_cols
+        # Last resort: first non-blank line is the header
+        for i, line in enumerate(lines):
+            if line.strip():
+                data_start = i
+                break
 
-    # Read header row and data rows
-    header_line = lines[data_start]
-    data_lines = lines[data_start + 1:]
+    if data_start is None:
+        raise ValueError("Could not detect a data header row in this CSV.")
 
-    # Build a CSV string
-    csv_text = header_line + "".join(data_lines)
-    df = pd.read_csv(io.StringIO(csv_text))
+    # ── Step 2: build DataFrame from header + data rows ──
+    csv_text = "".join(lines[data_start:])
+    try:
+        df = pd.read_csv(io.StringIO(csv_text))
+    except Exception as e:
+        raise ValueError(f"CSV parse error: {e}")
 
-    # Clean up column names
-    df.columns = [c.strip() for c in df.columns]
+    # Strip whitespace from column names
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.dropna(how="all", axis=1).dropna(how="all", axis=0)
 
-    # Rename first two columns
+    # ── Step 3: rename first column → timestamp, second → scan_number ──
     cols = list(df.columns)
     rename_map = {}
     if len(cols) >= 1:
@@ -119,33 +143,45 @@ def parse_raw_instrument_csv(filepath):
         rename_map[cols[1]] = "scan_number"
     df.rename(columns=rename_map, inplace=True)
 
-    # Drop entirely-empty columns
-    df.dropna(axis=1, how="all", inplace=True)
+    # ── Step 4: identify sensor/channel columns ──
+    non_sensor = {"timestamp", "scan_number"}
+    ch_cols = [c for c in df.columns if c not in non_sensor]
 
-    # Identify channel columns (everything except timestamp and scan_number)
-    ch_cols = [c for c in df.columns if c not in ("timestamp", "scan_number")]
+    # ── Step 5: numeric conversion + scrub sentinel values (notebook pattern) ──
+    for col in ch_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+        # Hardware overload sentinel: -9.9E+37 or any value > 10 000 in absolute
+        overload = (df[col].abs() > 10_000) | (df[col] == np.inf) | (df[col] == -np.inf)
+        df.loc[overload, col] = np.nan
 
-    # Replace sentinel values (-9.9E+37) with NaN
-    df.replace(-9.9e+37, np.nan, inplace=True)
-
+    # ── Step 6: parse timestamp ──
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
 
     return df, ch_cols
 
 
 def load_file(filepath):
-    """Auto-detect format and parse."""
+    """Auto-detect CSV format and parse — supports cleaned exports and raw instrument files."""
     fname = os.path.basename(filepath).lower()
+
+    # Explicit cleaned-file marker
     if "_cleaned" in fname:
         return parse_cleaned_csv(filepath)
-    else:
-        # Try to detect if it's a raw instrument file
+
+    # Peek at the first line to decide
+    try:
         with open(filepath, "r", encoding="utf-8", errors="replace") as f:
             first_line = f.readline()
-        if first_line.strip().startswith("timestamp,scan_number"):
-            return parse_cleaned_csv(filepath)
-        else:
-            return parse_raw_instrument_csv(filepath)
+    except Exception:
+        first_line = ""
+
+    if first_line.strip().lower().startswith("timestamp,scan_number"):
+        return parse_cleaned_csv(filepath)
+
+    # All instrument-format files go through the robust parser
+    return parse_raw_instrument_csv(filepath)
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -512,88 +548,253 @@ def get_stats():
 # LSTM Autoencoder (PyTorch) – train-on-the-fly
 # ---------------------------------------------------------------------------
 
-class _LSTMAutoencoder(nn.Module if TORCH_AVAILABLE else object):
-    def __init__(self, num_features):
+# ---------------------------------------------------------------------------
+# LSTMAutoencoder – exact architecture from the dataset notebooks
+# (Biomass / Cataluminescence / Default: hidden_size=32  |  Swiss: hidden_size=64)
+# hidden_size is auto-selected based on channel count, matching each notebook.
+# ---------------------------------------------------------------------------
+
+class LSTMAutoencoder(nn.Module if TORCH_AVAILABLE else object):
+    """
+    Exact architecture used in all four dataset-specific LSTM notebooks.
+    Encoder compresses the sequence to a bottleneck; decoder reconstructs it.
+    Anomalies = sequences the model cannot reconstruct well (high MAE).
+    """
+    def __init__(self, num_features, hidden_size=32):
         if not TORCH_AVAILABLE:
             return
-        super().__init__()
-        self.hidden_size = min(64, max(16, num_features * 4))
-        self.encoder = nn.LSTM(num_features, self.hidden_size, batch_first=True)
-        self.decoder = nn.LSTM(self.hidden_size, self.hidden_size, batch_first=True)
-        self.out = nn.Linear(self.hidden_size, num_features)
+        super(LSTMAutoencoder, self).__init__()
+        self.hidden_size = hidden_size
+
+        # Encoder: reads the input sequence and produces a latent vector
+        self.encoder_lstm = nn.LSTM(
+            input_size=num_features,
+            hidden_size=hidden_size,
+            batch_first=True
+        )
+        # Decoder: reconstructs the sequence from the latent vector
+        self.decoder_lstm = nn.LSTM(
+            input_size=hidden_size,
+            hidden_size=hidden_size,
+            batch_first=True
+        )
+        # Maps decoder output back to original feature space
+        self.output_layer = nn.Linear(hidden_size, num_features)
 
     def forward(self, x):
-        _, (h, _) = self.encoder(x)
-        rep = h[-1].unsqueeze(1).repeat(1, x.size(1), 1)
-        dec, _ = self.decoder(rep)
-        return self.out(dec)
+        batch_size, seq_len, _ = x.size()
+
+        # Compress: encode the full sequence → bottleneck hidden state
+        _, (hidden_state, _) = self.encoder_lstm(x)
+        last_hidden_state = hidden_state[-1]          # shape: (batch, hidden)
+
+        # Expand: repeat latent vector across every timestep for decoding
+        repeated_hidden = last_hidden_state.unsqueeze(1).repeat(1, seq_len, 1)
+
+        # Reconstruct
+        decoded, _ = self.decoder_lstm(repeated_hidden)
+        reconstructed = self.output_layer(decoded)
+        return reconstructed
 
 
-def _run_lstm(series_df, sensor_cols, time_steps=10, epochs=30, contamination=0.03):
-    """Train LSTM autoencoder on-the-fly and return per-sequence MAE + anomaly flags."""
+def _run_lstm(series_df, sensor_cols, time_steps=10, epochs=35, progress_cb=None):
+    """
+    Exact training + scoring pipeline from the dataset notebooks.
+    progress_cb(epoch, total_epochs, avg_loss) is called after each epoch
+    so the background thread can push live progress to the TASKS store.
+
+    Steps (match every notebook exactly):
+      1. StandardScaler normalisation
+      2. Sliding time windows (time_steps)
+      3. LSTMAutoencoder  –  hidden_size: 64 for ≥10 ch (Swiss), 32 otherwise
+      4. L1Loss + Adam, batch_size=16, 35 epochs
+      5. MAE reconstruction error per sequence
+      6. Threshold = 97th percentile
+      7. Confidence score 50-100 % for anomalies  (Complete_pipeline formula)
+    """
+    # 1. Normalise
     scaler = StandardScaler()
-    scaled = pd.DataFrame(scaler.fit_transform(series_df[sensor_cols]), columns=sensor_cols)
+    scaled = pd.DataFrame(
+        scaler.fit_transform(series_df[sensor_cols]),
+        columns=sensor_cols
+    )
 
-    # Build sequences
-    Xs = []
+    # 2. Build sliding time windows
+    Xs, ts_indices = [], []
     for i in range(len(scaled) - time_steps):
         Xs.append(scaled.iloc[i:i + time_steps].values)
+        ts_indices.append(i + time_steps - 1)
+
     if len(Xs) < 10:
-        raise ValueError("Not enough data points for LSTM (need > time_steps+10)")
+        raise ValueError(
+            f"Not enough data for LSTM (got {len(Xs)} sequences, need >10). "
+            "Try a smaller window or load a longer file."
+        )
 
     X_np = np.array(Xs, dtype=np.float32)
-    X_t = torch.tensor(X_np)
+    X_t  = torch.tensor(X_np)
 
-    loader = DataLoader(TensorDataset(X_t), batch_size=32, shuffle=False)
-    model = _LSTMAutoencoder(len(sensor_cols))
-    criterion = nn.L1Loss()
+    # 3. Auto-select hidden_size (matches each dataset notebook)
+    num_features = len(sensor_cols)
+    hidden_size  = 64 if num_features >= 10 else 32
+
+    # 4. DataLoader – batch_size=16 matches every notebook
+    loader = DataLoader(TensorDataset(X_t), batch_size=16, shuffle=False)
+
+    # 5. Initialise model
+    model     = LSTMAutoencoder(num_features=num_features, hidden_size=hidden_size)
+    criterion = nn.L1Loss()          # MAE loss
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
+    # 6. Training loop with per-epoch progress reporting
     model.train()
-    for _ in range(epochs):
+    for epoch in range(epochs):
+        epoch_loss = 0.0
         for (batch,) in loader:
             optimizer.zero_grad()
-            loss = criterion(model(batch), batch)
+            out  = model(batch)
+            loss = criterion(out, batch)
             loss.backward()
             optimizer.step()
+            epoch_loss += loss.item()
 
+        avg_loss = epoch_loss / len(loader)
+        if progress_cb:
+            progress_cb(epoch + 1, epochs, avg_loss)
+
+    # 7. Evaluate
     model.eval()
     with torch.no_grad():
-        recon = model(X_t).numpy()
+        reconstructed = model(X_t)
 
-    mae = np.mean(np.abs(recon - X_np), axis=(1, 2))
-    threshold = np.percentile(mae, (1 - contamination) * 100)
-    max_mae = mae.max()
+    X_np_back = X_t.numpy()
+    recon_np  = reconstructed.numpy()
+    mae_loss  = np.mean(np.abs(recon_np - X_np_back), axis=(1, 2))
 
-    def confidence(v):
+    # Threshold = 97th percentile  (identical to notebooks)
+    threshold = np.percentile(mae_loss, 97)
+    max_mae   = mae_loss.max()
+
+    def _confidence(v):
         if v <= threshold or max_mae == threshold:
             return 0.0
         return min(100.0, 50.0 + (v - threshold) / (max_mae - threshold) * 50.0)
 
-    flags = mae > threshold
-    scores = mae.tolist()
-    confs = [confidence(v) for v in mae]
-    # sequence index maps to the last timestep in the window
-    seq_indices = list(range(time_steps - 1, time_steps - 1 + len(mae)))
-    return flags, scores, confs, seq_indices, float(threshold)
+    flags  = (mae_loss > threshold).tolist()
+    scores = mae_loss.tolist()
+    confs  = [_confidence(v) for v in mae_loss]
+
+    return flags, scores, confs, ts_indices, float(threshold)
+
+
+def _lstm_task_worker(task_id, filepath, ch_cols, df, time_steps, epochs):
+    """
+    Background thread function.
+    Writes progress updates to TASKS[task_id] as training proceeds,
+    then writes the final result payload when done.
+    This is exactly what a Celery worker does — just without Redis.
+    """
+    def _update(status, progress, message, result=None, error=None):
+        with TASKS_LOCK:
+            TASKS[task_id].update({
+                "status":   status,
+                "progress": progress,
+                "message":  message,
+                "result":   result,
+                "error":    error,
+            })
+
+    def _progress_cb(epoch, total, avg_loss):
+        pct = int(epoch / total * 90)   # reserve 10 % for evaluate step
+        _update("training", pct,
+                f"Epoch {epoch}/{total}  —  avg MAE loss: {avg_loss:.5f}")
+
+    try:
+        _update("training", 0, "Preparing data and building model…")
+
+        flags, scores, confs, seq_indices, threshold = _run_lstm(
+            df, ch_cols,
+            time_steps=time_steps,
+            epochs=epochs,
+            progress_cb=_progress_cb,
+        )
+
+        _update("evaluating", 91, "Computing reconstruction errors and confidence scores…")
+
+        timestamps = (
+            df["timestamp"].astype(str).tolist()
+            if "timestamp" in df.columns
+            else list(range(len(df)))
+        )
+
+        anomaly_indices = [seq_indices[i] for i, f in enumerate(flags) if f]
+        anomaly_scores  = [scores[i]      for i, f in enumerate(flags) if f]
+        anomaly_confs   = [confs[i]       for i, f in enumerate(flags) if f]
+        anomaly_ts      = [timestamps[idx] for idx in anomaly_indices]
+
+        per_channel_values = {}
+        for col in ch_cols:
+            vals = df[col].tolist()
+            per_channel_values[col] = [
+                (None if (isinstance(vals[idx], float) and np.isnan(vals[idx])) else vals[idx])
+                for idx in anomaly_indices
+            ]
+
+        all_mae = [
+            {
+                "index":      seq_indices[i],
+                "timestamp":  timestamps[seq_indices[i]],
+                "mae":        scores[i],
+                "confidence": confs[i],
+            }
+            for i in range(len(scores))
+        ]
+
+        result_payload = {
+            "algorithm":          "lstm_autoencoder",
+            "channels":           ch_cols,
+            "total_points":       len(df),
+            "time_steps":         time_steps,
+            "epochs":             epochs,
+            "hidden_size":        64 if len(ch_cols) >= 10 else 32,
+            "threshold":          threshold,
+            "anomaly_count":      len(anomaly_indices),
+            "anomaly_indices":    anomaly_indices,
+            "anomaly_scores":     anomaly_scores,
+            "anomaly_confidences": anomaly_confs,
+            "anomaly_timestamps": anomaly_ts,
+            "per_channel_values": per_channel_values,
+            "all_mae":            all_mae,
+            # Summary metrics (mirrors the notebook's printed report)
+            "mean_mae":   float(np.mean([s for s in scores])),
+            "max_mae":    float(np.max([s for s in scores])),
+            "normal_count": len(df) - len(anomaly_indices),
+        }
+
+        _update("done", 100, f"Done — {len(anomaly_indices)} anomalies detected.", result=result_payload)
+
+    except Exception as exc:
+        _update("error", 0, str(exc), error=str(exc))
 
 
 # ---------------------------------------------------------------------------
-# New Routes
+# Routes – async LSTM
 # ---------------------------------------------------------------------------
 
-@app.route("/api/detect_lstm", methods=["POST"])
-def detect_lstm():
-    """Train LSTM Autoencoder on the fly and return anomaly results."""
+@app.route("/api/run_lstm", methods=["POST"])
+def run_lstm_async():
+    """
+    Spawn a background thread to train the LSTM and return {task_id} immediately.
+    The frontend then polls /api/task/<task_id> for live progress.
+    """
     if not TORCH_AVAILABLE:
         return jsonify({"error": "PyTorch not installed on server"}), 500
 
-    body = request.json
+    body       = request.json
     experiment = body.get("experiment", "")
-    filename = body.get("filename", "")
-    contamination = float(body.get("contamination", 0.03))
+    filename   = body.get("filename", "")
     time_steps = int(body.get("time_steps", 10))
-    epochs = int(body.get("epochs", 30))
+    epochs     = int(body.get("epochs", 35))
 
     filepath = os.path.join(UPLOAD_FOLDER, experiment, filename)
     if not os.path.exists(filepath):
@@ -607,50 +808,62 @@ def detect_lstm():
     if not ch_cols:
         return jsonify({"error": "No sensor channels found"}), 400
 
-    # Fill NaN for LSTM (forward-fill then back-fill)
-    df[ch_cols] = df[ch_cols].fillna(method="ffill").fillna(method="bfill")
+    # Impute NaN before handing off to the thread  (same as notebooks)
+    df[ch_cols] = df[ch_cols].ffill().bfill()
 
-    try:
-        flags, scores, confs, seq_indices, threshold = _run_lstm(
-            df, ch_cols, time_steps=time_steps, epochs=epochs, contamination=contamination
-        )
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    # Register the task
+    task_id = str(uuid.uuid4())
+    with TASKS_LOCK:
+        TASKS[task_id] = {
+            "status":   "pending",
+            "progress": 0,
+            "message":  "Queued — waiting to start…",
+            "result":   None,
+            "error":    None,
+            "created":  datetime.now().isoformat(),
+            "meta": {
+                "experiment": experiment,
+                "filename":   filename,
+                "channels":   ch_cols,
+                "epochs":     epochs,
+                "time_steps": time_steps,
+            }
+        }
 
-    timestamps = df["timestamp"].astype(str).tolist() if "timestamp" in df.columns else list(range(len(df)))
+    # Spawn background thread — does NOT block the HTTP response
+    t = threading.Thread(
+        target=_lstm_task_worker,
+        args=(task_id, filepath, ch_cols, df, time_steps, epochs),
+        daemon=True,
+    )
+    t.start()
 
-    anomaly_indices = [seq_indices[i] for i, f in enumerate(flags) if f]
-    anomaly_scores  = [scores[i] for i, f in enumerate(flags) if f]
-    anomaly_confs   = [confs[i] for i, f in enumerate(flags) if f]
-    anomaly_ts      = [timestamps[idx] for idx in anomaly_indices]
+    return jsonify({"task_id": task_id, "status": "pending"})
 
-    # Per-channel anomaly values at flagged indices
-    per_channel_values = {}
-    for col in ch_cols:
-        vals = df[col].tolist()
-        per_channel_values[col] = [
-            (None if (isinstance(vals[idx], float) and np.isnan(vals[idx])) else vals[idx])
-            for idx in anomaly_indices
-        ]
 
-    # All sequence MAE scores (for the reconstruction error chart)
-    all_mae = [{"index": seq_indices[i], "timestamp": timestamps[seq_indices[i]], "mae": scores[i], "confidence": confs[i]}
-               for i in range(len(scores))]
+@app.route("/api/task/<task_id>", methods=["GET"])
+def get_task(task_id):
+    """
+    Poll endpoint — the frontend calls this every 2 s to get live progress.
+    Returns the full result payload once status == 'done'.
+    """
+    with TASKS_LOCK:
+        task = TASKS.get(task_id)
+    if task is None:
+        return jsonify({"error": "Task not found"}), 404
+    return jsonify(task)
 
-    return jsonify({
-        "algorithm": "lstm_autoencoder",
-        "channels": ch_cols,
-        "total_points": len(df),
-        "time_steps": time_steps,
-        "threshold": threshold,
-        "anomaly_count": len(anomaly_indices),
-        "anomaly_indices": anomaly_indices,
-        "anomaly_scores": anomaly_scores,
-        "anomaly_confidences": anomaly_confs,
-        "anomaly_timestamps": anomaly_ts,
-        "per_channel_values": per_channel_values,
-        "all_mae": all_mae,
-    })
+
+@app.route("/api/tasks", methods=["GET"])
+def list_tasks():
+    """Return all tasks (for debugging/history view)."""
+    with TASKS_LOCK:
+        snapshot = {tid: {k: v for k, v in t.items() if k != "result"}
+                    for tid, t in TASKS.items()}
+    return jsonify(snapshot)
+
+
+
 
 
 @app.route("/api/confidence_interval", methods=["POST"])

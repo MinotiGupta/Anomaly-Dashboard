@@ -17,7 +17,6 @@ const state = {
   lstmResult: null,
   compareResult: null,
   ciVisible: false,
-  currentMode: 'classical',
   feedback: {},
   allChannelsVisible: true,
 };
@@ -101,10 +100,6 @@ async function selectFile(experiment, filename) {
     state.channelNames = data.channel_names;
     state.fileKey = data.file_key;
 
-    // Populate channel selectors
-    const opts = state.channelNames.map(c => `<option value="${c}">${c}</option>`).join('');
-    document.getElementById("select-channel").innerHTML = opts;
-    document.getElementById("select-channel-compare").innerHTML = opts;
     state.selectedChannel = state.channelNames[0];
     state.lstmResult = null;
     state.compareResult = null;
@@ -119,12 +114,11 @@ async function selectFile(experiment, filename) {
     document.getElementById("algo-section").style.display = "block";
     document.getElementById("anomaly-section").style.display = "none";
     document.getElementById("lstm-error-section").style.display = "none";
-    document.getElementById("compare-section").style.display = "none";
     document.getElementById("btn-export").style.display = "none";
 
     await loadStats();
     renderChart();
-    toast(`Loaded ${data.num_points} data points`, "success");
+    toast(`Loaded ${data.num_points} data points across ${state.channelNames.length} channel(s)`, "success");
 
   } catch (e) {
     toast("Failed to load file", "error");
@@ -134,7 +128,8 @@ async function selectFile(experiment, filename) {
 
 // ── Stats ──
 async function loadStats() {
-  const channel = document.getElementById("select-channel").value || state.channelNames[0];
+  const channel = state.selectedChannel || state.channelNames[0];
+
   const data = await api("/api/stats", {
     experiment: state.currentExperiment,
     filename: state.currentFile,
@@ -571,25 +566,14 @@ function renderChart() {
     });
   }
 
-  // Classical anomaly overlay
-  if (state.anomalyResult && state.currentMode === 'classical') {
+  // Anomaly overlay (LSTM results)
+  if (state.anomalyResult) {
     const ar = state.anomalyResult;
     traces.push({
       x: ar.anomaly_timestamps, y: ar.anomaly_values,
       name: `Anomalies (${ar.algorithm})`,
       type: 'scattergl', mode: 'markers',
       marker: { color: '#f43f5e', size: 8, symbol: 'diamond', line: { color: '#fff', width: 1 } },
-    });
-  }
-
-  // Compare consensus overlay
-  if (state.compareResult && state.currentMode === 'compare') {
-    const cr = state.compareResult;
-    traces.push({
-      x: cr.consensus_timestamps, y: cr.consensus_values,
-      name: 'Consensus Anomalies',
-      type: 'scattergl', mode: 'markers',
-      marker: { color: '#06b6d4', size: 10, symbol: 'diamond', line: { color: '#fff', width: 1 } },
     });
   }
 
@@ -613,33 +597,138 @@ function renderChart() {
 async function runLSTM() {
   if (!state.currentFile) { toast("Load a file first", "error"); return; }
 
-  const contamination = parseFloat(document.getElementById("lstm-contamination").value);
-  const epochs        = parseInt(document.getElementById("lstm-epochs").value);
-  const time_steps    = parseInt(document.getElementById("lstm-timesteps").value);
+  const epochs     = parseInt(document.getElementById("lstm-epochs").value);
+  const time_steps = parseInt(document.getElementById("lstm-timesteps").value);
 
-  toast(`Training LSTM (${epochs} epochs)… this may take a moment`, "info");
+  // Disable the button while running
+  const btn = document.querySelector('[onclick="runLSTM()"]');
+  if (btn) btn.disabled = true;
+
+  showTrainingProgress(0, "Submitting job to backend…");
 
   try {
-    const data = await api("/api/detect_lstm", {
+    // Step 1: POST → returns {task_id} immediately (non-blocking)
+    const job = await api("/api/run_lstm", {
       experiment: state.currentExperiment,
-      filename: state.currentFile,
-      contamination, epochs, time_steps,
+      filename:   state.currentFile,
+      epochs,
+      time_steps,
     });
 
-    if (data.error) { toast(data.error, "error"); return; }
-    state.lstmResult = data;
-    renderLSTMResults(data);
-    toast(`LSTM: ${data.anomaly_count} anomalies detected (threshold MAE: ${data.threshold.toFixed(4)})`, "success");
+    if (job.error) { toast(job.error, "error"); hideTrainingProgress(); if (btn) btn.disabled = false; return; }
+
+    toast(`Training started — task ${job.task_id.slice(0,8)}…`, "info");
+
+    // Step 2: Poll /api/task/{id} every 2 s
+    await pollTask(job.task_id, (task) => {
+      const pct = task.progress || 0;
+      const msg = task.message  || task.status;
+      showTrainingProgress(pct, msg);
+    });
+
   } catch (e) {
-    toast("LSTM detection failed", "error");
+    toast("Failed to start LSTM job", "error");
     console.error(e);
   }
+
+  hideTrainingProgress();
+  if (btn) btn.disabled = false;
 }
 
+// ── Task polling ──
+async function pollTask(taskId, onProgress) {
+  return new Promise((resolve, reject) => {
+    const INTERVAL_MS = 2000;
+
+    async function check() {
+      try {
+        const res = await fetch(`/api/task/${taskId}`);
+        const task = await res.json();
+
+        if (onProgress) onProgress(task);
+
+        if (task.status === "done") {
+          // Training complete — render results
+          const data = task.result;
+          state.lstmResult = data;
+          renderLSTMResults(data);
+          toast(
+            `✅ LSTM done — ${data.anomaly_count} anomalies (threshold: ${data.threshold.toFixed(4)}, ` +
+            `mean MAE: ${data.mean_mae.toFixed(4)})`,
+            "success"
+          );
+          resolve(task);
+
+        } else if (task.status === "error") {
+          toast(`LSTM error: ${task.error}`, "error");
+          reject(new Error(task.error));
+
+        } else {
+          // Still training — poll again
+          setTimeout(check, INTERVAL_MS);
+        }
+
+      } catch (e) {
+        toast("Lost connection to server", "error");
+        reject(e);
+      }
+    }
+
+    check();
+  });
+}
+
+// ── Training progress bar ──
+function showTrainingProgress(pct, message) {
+  let panel = document.getElementById("training-progress-panel");
+  if (!panel) {
+    panel = document.createElement("div");
+    panel.id = "training-progress-panel";
+    panel.className = "training-progress-panel";
+    document.getElementById("algo-section").appendChild(panel);
+  }
+  panel.style.display = "block";
+  panel.innerHTML = `
+    <div class="tp-header">
+      <span class="tp-label">🧠 Training LSTM…</span>
+      <span class="tp-pct">${pct}%</span>
+    </div>
+    <div class="tp-bar-track">
+      <div class="tp-bar-fill" style="width:${pct}%"></div>
+    </div>
+    <div class="tp-message">${message}</div>
+  `;
+}
+
+function hideTrainingProgress() {
+  const panel = document.getElementById("training-progress-panel");
+  if (panel) panel.style.display = "none";
+}
+
+
+
 function renderLSTMResults(data) {
+  // ── Model info card  (mirrors the notebook's printed METRICS report) ──
+  const infoCard = document.getElementById("lstm-model-info");
+  if (infoCard) {
+    infoCard.style.display = "grid";
+    infoCard.innerHTML = `
+      <div><div class="mi-label">Architecture</div><div class="mi-value">LSTM Autoencoder</div></div>
+      <div><div class="mi-label">hidden_size</div><div class="mi-value">${data.hidden_size || (data.channels.length >= 10 ? 64 : 32)}</div></div>
+      <div><div class="mi-label">Epochs</div><div class="mi-value">${data.epochs || '—'}</div></div>
+      <div><div class="mi-label">Window</div><div class="mi-value">${data.time_steps}</div></div>
+      <div><div class="mi-label">Total Sequences</div><div class="mi-value">${data.all_mae.length}</div></div>
+      <div><div class="mi-label">Mean MAE</div><div class="mi-value">${(data.mean_mae || 0).toFixed(5)}</div></div>
+      <div><div class="mi-label">Max MAE</div><div class="mi-value">${(data.max_mae || 0).toFixed(5)}</div></div>
+      <div><div class="mi-label">Threshold (97th %)</div><div class="mi-value">${data.threshold.toFixed(5)}</div></div>
+      <div><div class="mi-label">Anomalies Flagged</div><div class="mi-value" style="color:#f43f5e">${data.anomaly_count}</div></div>
+      <div><div class="mi-label">Normal Points</div><div class="mi-value" style="color:#10b981">${data.normal_count || data.total_points - data.anomaly_count}</div></div>
+    `;
+  }
+
   // Update threshold badge
-  document.getElementById("lstm-threshold-badge").textContent =
-    `Threshold: ${data.threshold.toFixed(4)}`;
+  const badge = document.getElementById("lstm-threshold-badge");
+  if (badge) badge.textContent = `Threshold: ${data.threshold.toFixed(4)}`;
 
   // Reconstruction error chart
   const maeX = data.all_mae.map(d => d.timestamp);
