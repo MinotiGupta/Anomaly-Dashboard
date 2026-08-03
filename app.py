@@ -25,6 +25,7 @@ from sklearn.neighbors import LocalOutlierFactor
 from sklearn.preprocessing import StandardScaler
 from flask import Flask, render_template, request, jsonify, send_file
 from flask_cors import CORS
+import feedback_db as fdb
 
 try:
     import torch
@@ -154,10 +155,18 @@ def parse_raw_instrument_csv(filepath):
         overload = (df[col].abs() > 10_000) | (df[col] == np.inf) | (df[col] == -np.inf)
         df.loc[overload, col] = np.nan
 
+    # ── Step 5b: drop columns that became entirely NaN after conversion ──
+    # (e.g. '101Time (Sec)' contains timestamps not sensor readings)
+    ch_cols = [c for c in ch_cols if df[c].notna().any()]
+    df.drop(columns=[c for c in df.columns
+                     if c not in {"timestamp", "scan_number"} and c not in ch_cols],
+            inplace=True)
+
     # ── Step 6: parse timestamp ──
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
 
     return df, ch_cols
+
 
 
 def load_file(filepath):
@@ -412,40 +421,75 @@ def detect_anomalies():
 
 @app.route("/api/feedback", methods=["POST"])
 def submit_feedback():
-    """Submit human-in-the-loop feedback for anomaly points."""
+    """
+    Submit human-in-the-loop feedback for anomaly points.
+    Stores labels in SQLite via feedback_db — survives restarts and supports
+    querying for the next training run.
+
+    Body: {
+      file_key: "experiment/file.csv",
+      channel: "",
+      labels: [
+        { point_index, label: "anomaly"|"normal", note, timestamp, value, mae_score, confidence }
+      ]
+    }
+    """
     body = request.json
     file_key = body.get("file_key", "")
-    channel = body.get("channel", "")
-    feedback_points = body.get("feedback_points", [])
-    # Each point: { index, value, timestamp, label: "anomaly"|"normal", note: "" }
+    channel  = body.get("channel", "")
+    labels   = body.get("labels", [])
 
-    all_feedback = load_feedback()
-    key = f"{file_key}::{channel}"
-    if key not in all_feedback:
-        all_feedback[key] = []
+    if not labels:
+        return jsonify({"error": "No labels provided"}), 400
 
-    for pt in feedback_points:
-        pt["submitted_at"] = datetime.now().isoformat()
-        # Update existing or append
-        existing = [p for p in all_feedback[key] if p.get("index") == pt.get("index")]
-        if existing:
-            existing[0].update(pt)
-        else:
-            all_feedback[key].append(pt)
+    fdb.save_labels_bulk(file_key, channel, labels)
+    summary = fdb.get_feedback_summary(file_key)
 
-    save_feedback(all_feedback)
-    return jsonify({"status": "ok", "total_feedback": len(all_feedback[key])})
+    return jsonify({
+        "status": "ok",
+        "saved": len(labels),
+        "summary": summary,
+    })
 
 
 @app.route("/api/feedback/get", methods=["POST"])
 def get_feedback():
-    """Retrieve stored feedback for a file/channel."""
+    """Retrieve all stored feedback labels for a file."""
     body = request.json
     file_key = body.get("file_key", "")
-    channel = body.get("channel", "")
-    key = f"{file_key}::{channel}"
-    all_feedback = load_feedback()
-    return jsonify(all_feedback.get(key, []))
+    channel  = body.get("channel", "")
+    labels = fdb.get_labels(file_key, channel)
+    summary = fdb.get_feedback_summary(file_key)
+    return jsonify({"labels": labels, "summary": summary})
+
+
+@app.route("/api/feedback/summary", methods=["POST"])
+def feedback_summary():
+    """Quick summary: how many anomalies confirmed / rejected for a file."""
+    body = request.json
+    file_key = body.get("file_key", "")
+    return jsonify(fdb.get_feedback_summary(file_key))
+
+
+@app.route("/api/feedback/delete", methods=["POST"])
+def delete_feedback():
+    """Delete a specific label."""
+    body = request.json
+    fdb.delete_label(
+        body.get("file_key", ""),
+        body.get("channel", ""),
+        body.get("point_index", -1),
+    )
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/training_history", methods=["POST"])
+def training_history():
+    """Get training run history for a file or all files."""
+    body = request.json
+    file_key = body.get("file_key", None)
+    runs = fdb.get_training_history(file_key, limit=50)
+    return jsonify(runs)
 
 
 @app.route("/api/upload", methods=["POST"])
@@ -687,12 +731,17 @@ def _run_lstm(series_df, sensor_cols, time_steps=10, epochs=35, progress_cb=None
     return flags, scores, confs, ts_indices, float(threshold)
 
 
-def _lstm_task_worker(task_id, filepath, ch_cols, df, time_steps, epochs):
+def _lstm_task_worker(task_id, file_key, filepath, ch_cols, df, time_steps, epochs):
     """
-    Background thread function.
-    Writes progress updates to TASKS[task_id] as training proceeds,
-    then writes the final result payload when done.
-    This is exactly what a Celery worker does — just without Redis.
+    Background thread function — trains the LSTM and incorporates human feedback.
+
+    Feedback integration strategy (semi-supervised post-hoc adjustment):
+      1. Train the autoencoder normally (unsupervised — same as notebooks)
+      2. After computing MAE scores, query the feedback DB for this file
+      3. Adjust the threshold using confirmed labels:
+         - If confirmed anomalies have MAE < auto-threshold → lower threshold to include them
+         - Points confirmed as normal → force-unflag them regardless of MAE
+      4. Record the training run in the database
     """
     def _update(status, progress, message, result=None, error=None):
         with TASKS_LOCK:
@@ -705,12 +754,18 @@ def _lstm_task_worker(task_id, filepath, ch_cols, df, time_steps, epochs):
             })
 
     def _progress_cb(epoch, total, avg_loss):
-        pct = int(epoch / total * 90)   # reserve 10 % for evaluate step
+        pct = int(epoch / total * 90)
         _update("training", pct,
                 f"Epoch {epoch}/{total}  —  avg MAE loss: {avg_loss:.5f}")
 
     try:
-        _update("training", 0, "Preparing data and building model…")
+        # ── Query existing feedback for this file ──
+        _update("training", 0, "Loading feedback labels…")
+        confirmed_anomaly_indices = set(fdb.get_confirmed_anomalies(file_key))
+        confirmed_normal_indices  = set(fdb.get_confirmed_normals(file_key))
+        feedback_count = len(confirmed_anomaly_indices) + len(confirmed_normal_indices)
+
+        _update("training", 1, f"Training with {feedback_count} feedback labels…")
 
         flags, scores, confs, seq_indices, threshold = _run_lstm(
             df, ch_cols,
@@ -719,7 +774,55 @@ def _lstm_task_worker(task_id, filepath, ch_cols, df, time_steps, epochs):
             progress_cb=_progress_cb,
         )
 
-        _update("evaluating", 91, "Computing reconstruction errors and confidence scores…")
+        _update("evaluating", 91, "Applying feedback adjustments…")
+
+        # ── Feedback-aware threshold adjustment ──
+        original_threshold = threshold
+
+        # Build a mapping: original_row_index → sequence_index
+        row_to_seq = {}
+        for seq_i, row_i in enumerate(seq_indices):
+            row_to_seq[row_i] = seq_i
+
+        # Check if confirmed anomalies were missed (MAE below threshold)
+        missed_anomaly_maes = []
+        for row_idx in confirmed_anomaly_indices:
+            seq_i = row_to_seq.get(row_idx)
+            if seq_i is not None and not flags[seq_i]:
+                missed_anomaly_maes.append(scores[seq_i])
+
+        # If confirmed anomalies were missed, lower threshold to catch them
+        if missed_anomaly_maes:
+            min_missed = min(missed_anomaly_maes)
+            # Set threshold to 95% of the lowest missed anomaly MAE
+            adjusted_threshold = min_missed * 0.95
+            if adjusted_threshold < threshold:
+                threshold = adjusted_threshold
+
+        # Re-flag with adjusted threshold
+        flags = [(s > threshold) for s in scores]
+
+        # Force-unflag confirmed normals (user said "this is NOT an anomaly")
+        for row_idx in confirmed_normal_indices:
+            seq_i = row_to_seq.get(row_idx)
+            if seq_i is not None:
+                flags[seq_i] = False
+
+        # Force-flag confirmed anomalies
+        for row_idx in confirmed_anomaly_indices:
+            seq_i = row_to_seq.get(row_idx)
+            if seq_i is not None:
+                flags[seq_i] = True
+
+        # Recalculate confidence scores with new threshold
+        max_mae = max(scores) if scores else 0
+        def _confidence(v):
+            if v <= threshold or max_mae == threshold:
+                return 0.0
+            return min(100.0, 50.0 + (v - threshold) / (max_mae - threshold) * 50.0)
+        confs = [_confidence(v) for v in scores]
+
+        _update("evaluating", 95, "Building result payload…")
 
         timestamps = (
             df["timestamp"].astype(str).tolist()
@@ -746,32 +849,64 @@ def _lstm_task_worker(task_id, filepath, ch_cols, df, time_steps, epochs):
                 "timestamp":  timestamps[seq_indices[i]],
                 "mae":        scores[i],
                 "confidence": confs[i],
+                "is_anomaly": flags[i],
+                # Include existing label if this point has feedback
+                "human_label": (
+                    "anomaly" if seq_indices[i] in confirmed_anomaly_indices
+                    else "normal" if seq_indices[i] in confirmed_normal_indices
+                    else ""
+                ),
             }
             for i in range(len(scores))
         ]
 
+        hidden_size = 64 if len(ch_cols) >= 10 else 32
+        mean_mae_val = float(np.mean(scores))
+        max_mae_val  = float(np.max(scores))
+
         result_payload = {
-            "algorithm":          "lstm_autoencoder",
-            "channels":           ch_cols,
-            "total_points":       len(df),
-            "time_steps":         time_steps,
-            "epochs":             epochs,
-            "hidden_size":        64 if len(ch_cols) >= 10 else 32,
-            "threshold":          threshold,
-            "anomaly_count":      len(anomaly_indices),
-            "anomaly_indices":    anomaly_indices,
-            "anomaly_scores":     anomaly_scores,
+            "algorithm":           "lstm_autoencoder",
+            "channels":            ch_cols,
+            "total_points":        len(df),
+            "time_steps":          time_steps,
+            "epochs":              epochs,
+            "hidden_size":         hidden_size,
+            "threshold":           threshold,
+            "original_threshold":  original_threshold,
+            "threshold_adjusted":  threshold != original_threshold,
+            "anomaly_count":       len(anomaly_indices),
+            "anomaly_indices":     anomaly_indices,
+            "anomaly_scores":      anomaly_scores,
             "anomaly_confidences": anomaly_confs,
-            "anomaly_timestamps": anomaly_ts,
-            "per_channel_values": per_channel_values,
-            "all_mae":            all_mae,
-            # Summary metrics (mirrors the notebook's printed report)
-            "mean_mae":   float(np.mean([s for s in scores])),
-            "max_mae":    float(np.max([s for s in scores])),
-            "normal_count": len(df) - len(anomaly_indices),
+            "anomaly_timestamps":  anomaly_ts,
+            "per_channel_values":  per_channel_values,
+            "all_mae":             all_mae,
+            "mean_mae":            mean_mae_val,
+            "max_mae":             max_mae_val,
+            "normal_count":        len(df) - len(anomaly_indices),
+            # Feedback metadata
+            "feedback_incorporated": feedback_count,
+            "confirmed_anomalies":   len(confirmed_anomaly_indices),
+            "confirmed_normals":     len(confirmed_normal_indices),
         }
 
-        _update("done", 100, f"Done — {len(anomaly_indices)} anomalies detected.", result=result_payload)
+        # ── Record training run in the database ──
+        try:
+            fdb.record_training_run(
+                task_id=task_id, file_key=file_key, epochs=epochs,
+                time_steps=time_steps, hidden_size=hidden_size,
+                num_channels=len(ch_cols), total_points=len(df),
+                anomaly_count=len(anomaly_indices), threshold=threshold,
+                mean_mae=mean_mae_val, max_mae=max_mae_val,
+                feedback_incorporated=feedback_count,
+            )
+        except Exception:
+            pass  # don't fail the task if DB write fails
+
+        _update("done", 100,
+                f"Done — {len(anomaly_indices)} anomalies detected"
+                + (f" ({feedback_count} feedback labels applied)." if feedback_count else "."),
+                result=result_payload)
 
     except Exception as exc:
         _update("error", 0, str(exc), error=str(exc))
@@ -808,8 +943,13 @@ def run_lstm_async():
     if not ch_cols:
         return jsonify({"error": "No sensor channels found"}), 400
 
-    # Impute NaN before handing off to the thread  (same as notebooks)
+    # Impute NaN before handing off to the thread
     df[ch_cols] = df[ch_cols].ffill().bfill()
+
+    file_key = f"{experiment}/{filename}"
+
+    # Check for existing feedback
+    fb_summary = fdb.get_feedback_summary(file_key)
 
     # Register the task
     task_id = str(uuid.uuid4())
@@ -822,23 +962,29 @@ def run_lstm_async():
             "error":    None,
             "created":  datetime.now().isoformat(),
             "meta": {
-                "experiment": experiment,
-                "filename":   filename,
-                "channels":   ch_cols,
-                "epochs":     epochs,
-                "time_steps": time_steps,
+                "experiment":  experiment,
+                "filename":    filename,
+                "file_key":    file_key,
+                "channels":    ch_cols,
+                "epochs":      epochs,
+                "time_steps":  time_steps,
+                "feedback":    fb_summary,
             }
         }
 
-    # Spawn background thread — does NOT block the HTTP response
+    # Spawn background thread
     t = threading.Thread(
         target=_lstm_task_worker,
-        args=(task_id, filepath, ch_cols, df, time_steps, epochs),
+        args=(task_id, file_key, filepath, ch_cols, df, time_steps, epochs),
         daemon=True,
     )
     t.start()
 
-    return jsonify({"task_id": task_id, "status": "pending"})
+    return jsonify({
+        "task_id":  task_id,
+        "status":   "pending",
+        "feedback": fb_summary,
+    })
 
 
 @app.route("/api/task/<task_id>", methods=["GET"])

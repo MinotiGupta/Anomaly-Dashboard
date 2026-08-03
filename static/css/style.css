@@ -828,3 +828,63 @@ input[type="range"] {
   font-size: 10px;
   font-weight: 600;
 }
+
+/* ── Feedback row states ── */
+.fb-confirmed {
+  background: rgba(16,185,129,0.06) !important;
+  border-left: 3px solid #10b981;
+}
+
+.fb-rejected {
+  background: rgba(244,63,94,0.04) !important;
+  border-left: 3px solid #f43f5e;
+  opacity: 0.65;
+}
+
+.fb-rejected td:nth-child(3) {
+  text-decoration: line-through;
+  text-decoration-color: #f43f5e;
+}
+
+.badge-anomaly-confirmed {
+  background: rgba(16,185,129,0.18);
+  color: #10b981;
+  border: 1px solid rgba(16,185,129,0.3);
+  padding: 2px 7px;
+  border-radius: 99px;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.badge-normal-confirmed {
+  background: rgba(244,63,94,0.15);
+  color: #f43f5e;
+  border: 1px solid rgba(244,63,94,0.3);
+  padding: 2px 7px;
+  border-radius: 99px;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+/* ── Feedback buttons ── */
+.feedback-btns {
+  display: flex;
+  gap: 4px;
+}
+
+.fb-btn {
+  padding: 3px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(99,102,241,0.2);
+  background: rgba(99,102,241,0.06);
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.fb-btn:hover {
+  background: rgba(99,102,241,0.15);
+  border-color: rgba(99,102,241,0.4);
+  color: var(--text-primary);
+}

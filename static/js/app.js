@@ -24,8 +24,8 @@ const state = {
 // ── Bootstrap ──
 document.addEventListener("DOMContentLoaded", () => {
   loadExperiments();
-  updateAlgoParams();
 });
+
 
 // ── API helpers ──
 async function api(url, body = null) {
@@ -809,90 +809,195 @@ function renderLSTMResults(data) {
     anomaly_timestamps: data.anomaly_timestamps,
   };
   updateFeedbackSummary();
+
+  // Re-render main chart with anomaly overlay
+  renderChart();
 }
 
-// ── Algorithm Comparison ──
-async function runCompare() {
-  if (!state.currentFile) { toast("Load a file first", "error"); return; }
+// ── Human-in-the-Loop Feedback System ──
 
-  const channel = document.getElementById("select-channel-compare").value;
-  toast(`Running all algorithms on ${channel}…`, "info");
+// In-memory feedback state for the current session
+// Maps point_index → { label: "anomaly"|"normal"|"", note: "", ... }
+const pendingFeedback = {};
+
+function setFeedback(pointIndex, label) {
+  // Toggle: clicking same label again clears it
+  if (pendingFeedback[pointIndex] && pendingFeedback[pointIndex].label === label) {
+    pendingFeedback[pointIndex].label = "";
+    label = "";
+  } else {
+    if (!pendingFeedback[pointIndex]) pendingFeedback[pointIndex] = {};
+    pendingFeedback[pointIndex].label = label;
+  }
+
+  // Update row visual
+  const row = document.getElementById(`anomaly-row-${pointIndex}`);
+  if (row) {
+    row.classList.remove("fb-confirmed", "fb-rejected");
+    if (label === "anomaly") row.classList.add("fb-confirmed");
+    if (label === "normal")  row.classList.add("fb-rejected");
+  }
+
+  // Update label badge
+  const badge = document.getElementById(`label-${pointIndex}`);
+  if (badge) {
+    if (label === "anomaly") {
+      badge.textContent = "✓ Anomaly";
+      badge.className = "badge badge-anomaly-confirmed";
+    } else if (label === "normal") {
+      badge.textContent = "✗ Normal";
+      badge.className = "badge badge-normal-confirmed";
+    } else {
+      badge.textContent = "unlabeled";
+      badge.className = "badge";
+    }
+  }
+
+  updateFeedbackSummary();
+}
+
+function setFeedbackNote(pointIndex, note) {
+  if (!pendingFeedback[pointIndex]) pendingFeedback[pointIndex] = {};
+  pendingFeedback[pointIndex].note = note;
+}
+
+function confirmAll() {
+  if (!state.lstmResult) return;
+  state.lstmResult.anomaly_indices.forEach(idx => setFeedback(idx, "anomaly"));
+  toast("All anomalies marked as confirmed", "success");
+}
+
+function rejectAll() {
+  if (!state.lstmResult) return;
+  state.lstmResult.anomaly_indices.forEach(idx => setFeedback(idx, "normal"));
+  toast("All anomalies marked as normal (false positives)", "info");
+}
+
+async function submitAllFeedback() {
+  if (!state.fileKey) { toast("No file loaded", "error"); return; }
+
+  const labels = [];
+  const lstmData = state.lstmResult;
+
+  for (const [idxStr, fb] of Object.entries(pendingFeedback)) {
+    if (!fb.label) continue;  // skip unlabeled
+    const pointIndex = parseInt(idxStr);
+
+    // Find the corresponding anomaly data
+    const anomalyPos = lstmData ? lstmData.anomaly_indices.indexOf(pointIndex) : -1;
+
+    labels.push({
+      point_index: pointIndex,
+      label:       fb.label,
+      note:        fb.note || "",
+      timestamp:   anomalyPos >= 0 ? lstmData.anomaly_timestamps[anomalyPos] : null,
+      value:       anomalyPos >= 0 && lstmData.per_channel_values[lstmData.channels[0]]
+                     ? lstmData.per_channel_values[lstmData.channels[0]][anomalyPos] : null,
+      mae_score:   anomalyPos >= 0 ? lstmData.anomaly_scores[anomalyPos] : null,
+      confidence:  anomalyPos >= 0 ? lstmData.anomaly_confidences[anomalyPos] : null,
+    });
+  }
+
+  if (labels.length === 0) {
+    toast("No labels to submit — mark anomalies as ✓ or ✗ first", "info");
+    return;
+  }
 
   try {
-    const data = await api("/api/compare", {
-      experiment: state.currentExperiment,
-      filename: state.currentFile,
-      channel,
+    const res = await api("/api/feedback", {
+      file_key: state.fileKey,
+      channel:  "",
+      labels:   labels,
     });
-    if (data.error) { toast(data.error, "error"); return; }
-    state.compareResult = data;
-    state.selectedChannel = channel;
-    renderCompareResults(data, channel);
-    toast(`Consensus: ${data.consensus_count} anomalies agreed by ≥2 algorithms`, "success");
+
+    if (res.error) { toast(res.error, "error"); return; }
+
+    toast(`✅ Saved ${res.saved} feedback labels to database`, "success");
+    updateFeedbackSummary(res.summary);
   } catch (e) {
-    toast("Comparison failed", "error");
+    toast("Failed to save feedback", "error");
     console.error(e);
   }
 }
 
-function renderCompareResults(data, channel) {
-  const ALGO_LABELS = {
-    zscore: 'Z-Score', iqr: 'IQR',
-    isolation_forest: 'Iso. Forest', lof: 'LOF', rolling_stats: 'Rolling',
-  };
+function updateFeedbackSummary(serverSummary) {
+  const section = document.getElementById("feedback-summary");
+  if (!section) return;
 
-  // Summary cards
-  const grid = document.getElementById("compare-grid");
-  const cards = Object.entries(data.per_algorithm).map(([name, res]) => `
-    <div class="compare-card">
-      <div class="cc-name">${ALGO_LABELS[name] || name}</div>
-      <div class="cc-count">${res.anomaly_count}</div>
-    </div>`).join('');
-  grid.innerHTML = cards + `
-    <div class="compare-card consensus">
-      <div class="cc-name">Consensus ≥2</div>
-      <div class="cc-count">${data.consensus_count}</div>
-    </div>`;
+  // Count local pending labels
+  let confirmed = 0, rejected = 0, total = 0;
+  for (const fb of Object.values(pendingFeedback)) {
+    if (fb.label === "anomaly") confirmed++;
+    if (fb.label === "normal") rejected++;
+    if (fb.label) total++;
+  }
 
-  // Heatmap-style vote chart: vote_counts bar
-  const allAlgos = Object.keys(data.per_algorithm);
-  const traceData = [];
+  let html = `
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; font-size:12px">
+      <div><span style="color:#10b981; font-weight:600">${confirmed}</span> confirmed</div>
+      <div><span style="color:#f43f5e; font-weight:600">${rejected}</span> rejected</div>
+      <div colspan="2">${total} labels pending</div>
+    </div>
+  `;
 
-  // One trace per algorithm (scatter showing their anomaly positions)
-  allAlgos.forEach((name, i) => {
-    const indices = data.per_algorithm[name].anomaly_indices;
-    traceData.push({
-      x: indices.map(idx => state.timestamps[idx]),
-      y: Array(indices.length).fill(ALGO_LABELS[name] || name),
-      mode: 'markers',
-      type: 'scatter',
-      name: ALGO_LABELS[name] || name,
-      marker: { size: 8, symbol: 'line-ns', line: { width: 2 } },
+  if (serverSummary) {
+    html += `
+      <div style="margin-top:8px; padding-top:8px; border-top:1px solid rgba(99,102,241,0.15); font-size:11px; color:var(--text-muted)">
+        Database: ${serverSummary.confirmed_anomalies || 0} confirmed,
+        ${serverSummary.confirmed_normals || 0} rejected,
+        ${serverSummary.total || 0} total labels
+      </div>
+    `;
+  }
+
+  section.innerHTML = html;
+}
+
+async function loadExistingFeedback() {
+  if (!state.fileKey) return;
+
+  try {
+    const res = await api("/api/feedback/get", {
+      file_key: state.fileKey,
+      channel: "",
     });
-  });
 
-  // Consensus
-  traceData.push({
-    x: data.consensus_timestamps,
-    y: Array(data.consensus_count).fill('Consensus'),
-    mode: 'markers', type: 'scatter',
-    name: 'Consensus',
-    marker: { color: '#06b6d4', size: 10, symbol: 'diamond' },
-  });
+    if (res.labels && res.labels.length > 0) {
+      for (const label of res.labels) {
+        const idx = label.point_index;
+        pendingFeedback[idx] = {
+          label: label.label,
+          note:  label.note || "",
+        };
 
-  Plotly.react('compare-chart', traceData, {
-    paper_bgcolor: 'rgba(0,0,0,0)',
-    plot_bgcolor: 'rgba(13,20,37,0.8)',
-    font: { family: 'Inter', color: '#8b95b0', size: 12 },
-    margin: { t: 20, r: 30, b: 60, l: 120 },
-    xaxis: { gridcolor: 'rgba(99,130,255,0.08)', title: 'Time' },
-    yaxis: { gridcolor: 'rgba(99,130,255,0.08)' },
-    legend: { bgcolor: 'rgba(0,0,0,0)' },
-    height: 280,
-    title: { text: `Algorithm Comparison – ${channel}`, font: { size: 13 } },
-  }, { responsive: true });
+        // Update UI if row exists
+        const badge = document.getElementById(`label-${idx}`);
+        if (badge) {
+          if (label.label === "anomaly") {
+            badge.textContent = "✓ Anomaly";
+            badge.className = "badge badge-anomaly-confirmed";
+          } else if (label.label === "normal") {
+            badge.textContent = "✗ Normal";
+            badge.className = "badge badge-normal-confirmed";
+          }
+        }
 
-  document.getElementById("compare-section").style.display = "block";
-  renderChart(); // overlay consensus on main chart
+        const row = document.getElementById(`anomaly-row-${idx}`);
+        if (row) {
+          row.classList.remove("fb-confirmed", "fb-rejected");
+          if (label.label === "anomaly") row.classList.add("fb-confirmed");
+          if (label.label === "normal")  row.classList.add("fb-rejected");
+        }
+
+        const noteInput = document.getElementById(`note-${idx}`);
+        if (noteInput && label.note) noteInput.value = label.note;
+      }
+
+      updateFeedbackSummary(res.summary);
+      toast(`Loaded ${res.labels.length} existing feedback labels`, "info");
+    }
+  } catch (e) {
+    console.error("Failed to load existing feedback:", e);
+  }
 }
 
