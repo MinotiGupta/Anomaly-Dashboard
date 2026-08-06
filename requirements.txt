@@ -1,7 +1,0 @@
-flask
-flask-cors
-pandas
-numpy
-scipy
-scikit-learn
-torch
