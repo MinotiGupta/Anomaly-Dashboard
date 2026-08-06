@@ -594,6 +594,63 @@ def run_pipeline(file_path, use_feedback=False):
         "mae_values": per_feature_mae.tolist(),
     }
 
+    # Per-channel statistics (mean, std, skewness, kurtosis, 95% CI)
+    from scipy import stats as scipy_stats
+    channel_statistics = {}
+    for col in sensors:
+        col_data = df[col].dropna()
+        n = len(col_data)
+        mean_val = float(col_data.mean())
+        std_val = float(col_data.std())
+        skew_val = float(col_data.skew())
+        kurt_val = float(col_data.kurtosis())
+        min_val = float(col_data.min())
+        max_val = float(col_data.max())
+        q1 = float(col_data.quantile(0.25))
+        median_val = float(col_data.median())
+        q3 = float(col_data.quantile(0.75))
+        iqr = q3 - q1
+
+        # 95% confidence interval for the mean
+        if n > 1 and std_val > 0:
+            se = std_val / np.sqrt(n)
+            ci_low = mean_val - 1.96 * se
+            ci_high = mean_val + 1.96 * se
+        else:
+            ci_low = mean_val
+            ci_high = mean_val
+
+        channel_statistics[col] = {
+            "mean": mean_val,
+            "std": std_val,
+            "min": min_val,
+            "max": max_val,
+            "q1": q1,
+            "median": median_val,
+            "q3": q3,
+            "iqr": iqr,
+            "skewness": skew_val,
+            "kurtosis": kurt_val,
+            "ci_95_low": ci_low,
+            "ci_95_high": ci_high,
+            "count": n,
+        }
+
+    # Confidence score distribution for anomalies
+    anomaly_confidences = anomalies_df["Confidence_Score"].tolist()
+    if anomaly_confidences:
+        conf_hist, conf_bin_edges = np.histogram(anomaly_confidences, bins=20,
+                                                  range=(50, 100))
+        confidence_distribution = {
+            "counts": conf_hist.tolist(),
+            "bin_edges": conf_bin_edges.tolist(),
+        }
+    else:
+        confidence_distribution = {
+            "counts": [],
+            "bin_edges": [],
+        }
+
     # Load existing feedback for this data type
     existing_feedback = {}
     if data_type != "unknown":
@@ -611,6 +668,8 @@ def run_pipeline(file_path, use_feedback=False):
         "training_loss": training_loss,
         "anomaly_table": anomaly_table,
         "feature_contribution": feature_contribution,
+        "channel_statistics": channel_statistics,
+        "confidence_distribution": confidence_distribution,
         "total_anomalies": len(anomalies_df),
         "total_points": len(merged_df),
         "anomaly_rate": round(len(anomalies_df) / max(len(merged_df), 1) * 100, 2),

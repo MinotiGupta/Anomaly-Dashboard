@@ -3,8 +3,10 @@ import ChannelChart from './ChannelChart';
 import TrainingLossChart from './TrainingLossChart';
 import MAEDistributionChart from './MAEDistributionChart';
 import FeatureContributionChart from './FeatureContributionChart';
+import ConfidenceDistributionChart from './ConfidenceDistributionChart';
 import AnomalyTable from './AnomalyTable';
 import MetadataPanel from './MetadataPanel';
+import StatisticsPanel from './StatisticsPanel';
 
 const DATA_TYPE_LABELS = {
   biomass: 'Biomass',
@@ -22,6 +24,7 @@ export default function ResultsDashboard({ data, runId, onRerun }) {
     { id: 'channels', label: 'Sensor Channels' },
     { id: 'diagnostics', label: 'Model Diagnostics' },
     { id: 'table', label: 'Anomaly Log' },
+    { id: 'statistics', label: 'Statistics' },
   ];
 
   return (
@@ -129,6 +132,9 @@ export default function ResultsDashboard({ data, runId, onRerun }) {
             existingFeedback={data.existing_feedback || {}}
           />
         )}
+        {activeTab === 'statistics' && (
+          <StatisticsPanel channelStats={data.channel_statistics} />
+        )}
       </div>
     </div>
   );
@@ -136,25 +142,28 @@ export default function ResultsDashboard({ data, runId, onRerun }) {
 
 function OverviewTab({ data }) {
   const channelNames = Object.keys(data.channels);
-  const firstChannel = channelNames[0];
 
   return (
     <>
-      <div className="chart-grid">
-        <div className="card">
+      {/* All channel charts (one per channel) */}
+      {channelNames.map((ch) => (
+        <div className="card" key={ch} style={{ marginBottom: '20px' }}>
           <div className="card__header">
-            <span className="card__title">Primary Channel: {firstChannel}</span>
+            <span className="card__title">{ch}</span>
             <span className="card__badge card__badge--red">
-              {data.channels[firstChannel].anomaly_timestamps.length} anomalies
+              {data.channels[ch].anomaly_timestamps.length} anomalies
             </span>
           </div>
           <ChannelChart
-            channelName={firstChannel}
-            channelData={data.channels[firstChannel]}
-            height={280}
+            channelName={ch}
+            channelData={data.channels[ch]}
+            height={240}
           />
         </div>
+      ))}
 
+      {/* Training loss + Confidence distribution */}
+      <div className="chart-grid">
         <div className="card">
           <div className="card__header">
             <span className="card__title">Training Loss (MAE)</span>
@@ -162,8 +171,22 @@ function OverviewTab({ data }) {
           </div>
           <TrainingLossChart data={data.training_loss} height={280} />
         </div>
+
+        <div className="card">
+          <div className="card__header">
+            <span className="card__title">Anomaly Confidence Distribution</span>
+            <span className="card__badge card__badge--amber">
+              {data.total_anomalies} anomalies
+            </span>
+          </div>
+          <ConfidenceDistributionChart
+            data={data.confidence_distribution}
+            height={280}
+          />
+        </div>
       </div>
 
+      {/* MAE Distribution + Feature Contribution */}
       <div className="chart-grid">
         <div className="card">
           <div className="card__header">
@@ -217,7 +240,67 @@ function ChannelsTab({ data }) {
           height={360}
         />
       </div>
+
+      {/* Per-channel stats for selected channel */}
+      {data.channel_statistics && data.channel_statistics[selectedChannel] && (
+        <div className="card">
+          <div className="card__header">
+            <span className="card__title">Channel Statistics: {selectedChannel}</span>
+          </div>
+          <ChannelStatsGrid stats={data.channel_statistics[selectedChannel]} />
+        </div>
+      )}
     </>
+  );
+}
+
+function ChannelStatsGrid({ stats }) {
+  const items = [
+    { label: 'Mean', value: stats.mean?.toFixed(4) },
+    { label: 'Std Dev', value: stats.std?.toFixed(4) },
+    { label: 'Min', value: stats.min?.toFixed(4) },
+    { label: 'Max', value: stats.max?.toFixed(4) },
+    { label: 'Skewness', value: stats.skewness?.toFixed(4), color: getSkewColor(stats.skewness) },
+    { label: 'Kurtosis', value: stats.kurtosis?.toFixed(4), color: getKurtColor(stats.kurtosis) },
+    { label: '95% CI Low', value: stats.ci_95_low?.toFixed(4) },
+    { label: '95% CI High', value: stats.ci_95_high?.toFixed(4) },
+  ];
+
+  return (
+    <div
+      style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))',
+        gap: '12px',
+      }}
+    >
+      {items.map(({ label, value, color }) => (
+        <div key={label}>
+          <span
+            style={{
+              fontSize: '0.7rem',
+              textTransform: 'uppercase',
+              letterSpacing: '0.06em',
+              color: 'var(--text-muted)',
+              display: 'block',
+              marginBottom: 2,
+            }}
+          >
+            {label}
+          </span>
+          <span
+            style={{
+              fontSize: '1rem',
+              fontWeight: 600,
+              color: color || 'var(--text-secondary)',
+              fontFamily: 'var(--font-mono)',
+            }}
+          >
+            {value}
+          </span>
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -240,6 +323,16 @@ function DiagnosticsTab({ data }) {
           </span>
         </div>
         <MAEDistributionChart data={data.mae_distribution} height={320} />
+      </div>
+
+      <div className="card">
+        <div className="card__header">
+          <span className="card__title">Anomaly Confidence Distribution</span>
+        </div>
+        <ConfidenceDistributionChart
+          data={data.confidence_distribution}
+          height={320}
+        />
       </div>
 
       <div className="card">
@@ -292,4 +385,20 @@ function ConfigRow({ label, value }) {
       </span>
     </div>
   );
+}
+
+function getSkewColor(skew) {
+  if (skew == null) return undefined;
+  const abs = Math.abs(skew);
+  if (abs > 1) return '#ef4444';
+  if (abs > 0.5) return '#f59e0b';
+  return '#22c55e';
+}
+
+function getKurtColor(kurt) {
+  if (kurt == null) return undefined;
+  const abs = Math.abs(kurt);
+  if (abs > 3) return '#ef4444';
+  if (abs > 1) return '#f59e0b';
+  return '#22c55e';
 }
