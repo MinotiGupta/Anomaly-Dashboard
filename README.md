@@ -80,7 +80,7 @@ dashboard/
 
 Open a terminal and navigate to the `backend` directory:
 ```bash
-cd C:\IITM_project\dashboard\backend
+cd dashboard\backend
 ```
 
 Install the required Python packages:
