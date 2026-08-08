@@ -8,6 +8,7 @@ This project provides a robust, interactive dashboard to upload sensor data (CSV
 
 ## Key Features
 
+- **MLOps & Model Persistence:** Models and data scalers are saved locally after training. Subsequent runs on the same instrument data type load the saved PyTorch `.pth` weights for instant inference (no redundant training).
 - **LSTM Autoencoder Pipeline:** Dynamically scales hidden layers based on the number of input features. Trains on uploaded data to learn normal behavior and flags sequences with high reconstruction error (MAE).
 - **Automatic Data Classification:** Intelligently parses CSV headers to identify the data source (Biomass, Cataluminescence, Swiss Roll, or Default 34970A instruments).
 - **Instrument Metadata Extraction:** Automatically extracts and displays hardware metadata (Model, Serial Number, Firmware, Channel Configurations) from Agilent/Keysight log files.
@@ -35,6 +36,17 @@ This project provides a robust, interactive dashboard to upload sensor data (CSV
 - **Recharts:** Composable charting library for React.
 - **Vanilla CSS:** Custom, modern, dark-themed design system (no external CSS frameworks).
 
+## Model Architecture
+
+The core anomaly detection engine relies on a PyTorch-based **LSTM Autoencoder** designed for multivariate time-series data. The project contains multiple Jupyter Notebooks (`*LSTM_autoencoder.ipynb`) demonstrating the model on specific datasets (Biomass, Cataluminescence, Swiss Roll). The dashboard uses a unified, dynamic version:
+
+- **DynamicLSTMAutoencoder:** 
+  - **Encoder:** An LSTM layer that compresses the input sequence of `num_features` into a bottleneck latent representation (`hidden_size`).
+  - **Hidden Size:** Dynamically scaled based on input features (`min(64, max(16, num_features * 4))`).
+  - **Decoder:** An LSTM layer that takes the latent representation and attempts to reconstruct the original time-series sequence.
+  - **Sliding Window:** Processes data in time-step sequences (e.g., 10 time steps per window).
+  - **Anomaly Scoring:** The Mean Absolute Error (MAE) between the input sequence and the reconstructed sequence serves as the anomaly score. High MAE indicates the model hasn't seen this pattern before, flagging it as an anomaly.
+
 ## Architecture
 
 ```
@@ -43,7 +55,8 @@ dashboard/
 │   ├── app.py                 # Core Flask API, PyTorch model, and data processing
 │   ├── requirements.txt       # Python dependencies
 │   ├── uploads/               # Temporary storage for uploaded CSVs
-│   └── feedback_db/           # SQLite databases (auto-generated)
+│   ├── feedback_db/           # SQLite databases (auto-generated)
+│   └── models/                # Saved PyTorch .pth weights and .pkl scalers
 └── frontend/
     ├── package.json           # Node dependencies
     ├── index.html             # Entry HTML
@@ -67,7 +80,7 @@ dashboard/
 
 Open a terminal and navigate to the `backend` directory:
 ```bash
-cd c:\dev\AnomalyDetection\dashboard\backend
+cd C:\IITM_project\dashboard\backend
 ```
 
 Install the required Python packages:
@@ -86,7 +99,7 @@ The backend will run on `http://127.0.0.1:5000`.
 
 Open a new terminal and navigate to the `frontend` directory:
 ```bash
-cd c:\dev\AnomalyDetection\dashboard\frontend
+cd C:\IITM_project\dashboard\frontend
 ```
 
 Install the required Node packages:
