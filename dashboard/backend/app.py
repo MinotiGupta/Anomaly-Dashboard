@@ -22,6 +22,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
+from scipy.stats import gaussian_kde
+from scipy.signal import argrelextrema
 import traceback
 
 
@@ -110,8 +112,34 @@ def get_model_paths(model_key):
     }
 
 
+def compute_kde_threshold(mae_scores):
+    """Compute an anomaly threshold using KDE valley detection.
+
+    Fits a KDE to the MAE score distribution and finds the first local
+    minimum (valley) as the natural decision boundary between normal and
+    anomalous reconstruction errors.  Falls back to the 97th percentile
+    when the distribution is unimodal (no valley exists).
+
+    Returns (threshold, method_used, kde_x, kde_y).
+    """
+    kde = gaussian_kde(mae_scores)
+    x_range = np.linspace(float(np.min(mae_scores)), float(np.max(mae_scores)), 1000)
+    kde_values = kde(x_range)
+
+    minima_indices = argrelextrema(kde_values, np.less)[0]
+    if len(minima_indices) > 0:
+        threshold = float(x_range[minima_indices[0]])
+        method = "KDE Local Minimum (Valley)"
+    else:
+        threshold = float(np.percentile(mae_scores, 97))
+        method = "97th Percentile Fallback"
+
+    return threshold, method, x_range.tolist(), kde_values.tolist()
+
+
 def save_model_artifacts(model, scaler, model_key, sensor_cols,
-                         data_type, epoch_losses, used_feedback=False):
+                         data_type, epoch_losses, used_feedback=False,
+                         threshold=None, threshold_method=None):
     """Persist model weights, fitted scaler, and training metadata locally."""
     paths = get_model_paths(model_key)
 
@@ -122,7 +150,7 @@ def save_model_artifacts(model, scaler, model_key, sensor_cols,
     with open(paths["scaler"], "wb") as f:
         pickle.dump(scaler, f)
 
-    # Save metadata
+    # Save metadata (threshold included so inference is stable)
     meta = {
         "model_key": model_key,
         "data_type": data_type,
@@ -133,11 +161,13 @@ def save_model_artifacts(model, scaler, model_key, sensor_cols,
         "num_epochs": len(epoch_losses),
         "final_loss": epoch_losses[-1] if epoch_losses else None,
         "used_feedback": used_feedback,
+        "threshold": threshold,
+        "threshold_method": threshold_method,
     }
     with open(paths["meta"], "w") as f:
         json.dump(meta, f, indent=2)
 
-    print(f"[MLOps] Saved model artifacts: {model_key}")
+    print(f"[MLOps] Saved model artifacts: {model_key} (threshold={threshold:.6f} via {threshold_method})")
     return meta
 
 
@@ -578,9 +608,15 @@ def train_with_feedback(model, train_loader, X_tensor, timestamps,
 
 
 def detect_anomalies(
-    model, X_seq_tensor, df_timestamps, df_original, sensor_cols, contamination=0.03
+    model, X_seq_tensor, df_timestamps, df_original, sensor_cols,
+    saved_threshold=None
 ):
-    """Detect anomalies and compute confidence scores."""
+    """Detect anomalies using a KDE-derived or persisted threshold.
+
+    If saved_threshold is provided (loaded from _meta.json), it is used
+    directly for stable, consistent inference across different files.
+    Otherwise, KDE valley detection is run on the current MAE scores.
+    """
     model.eval()
     with torch.no_grad():
         reconstructed = model(X_seq_tensor)
@@ -596,8 +632,18 @@ def detect_anomalies(
         np.abs(reconstructed_np[:, -1, :] - X_seq_np[:, -1, :]), axis=0
     )
 
-    threshold = np.percentile(mae_loss, (1 - contamination) * 100)
-    max_mae = np.max(mae_loss)
+    # KDE curve always computed for visualization
+    kde_threshold, kde_method, kde_x, kde_y = compute_kde_threshold(mae_loss)
+
+    # Use saved threshold for stable inference; fall back to KDE on first run
+    if saved_threshold is not None:
+        threshold = float(saved_threshold)
+        threshold_method = "Loaded from saved model"
+    else:
+        threshold = kde_threshold
+        threshold_method = kde_method
+
+    max_mae = float(np.max(mae_loss))
 
     results_df = pd.DataFrame(
         {
@@ -622,7 +668,16 @@ def detect_anomalies(
     merged_df = pd.merge(results_df, df_original, on="Timestamp", how="inner")
     anomalies_only = merged_df[merged_df["Is_Anomaly"] == True]
 
-    return merged_df, anomalies_only, threshold, mae_loss, per_feature_mae
+    kde_data = {
+        "x": kde_x,
+        "y": kde_y,
+        "threshold": threshold,
+        "threshold_method": threshold_method,
+        "kde_threshold": kde_threshold,
+        "kde_method": kde_method,
+    }
+
+    return merged_df, anomalies_only, threshold, mae_loss, per_feature_mae, kde_data
 
 
 def run_pipeline(file_path, use_feedback=False, force_retrain=False):
@@ -704,10 +759,24 @@ def run_pipeline(file_path, use_feedback=False, force_retrain=False):
                 model, train_loader, num_epochs=30
             )
 
-        # Save model artifacts (.pth + scaler + metadata)
+        # Compute KDE threshold on training data BEFORE saving
+        TIME_STEPS_TRAIN = 10
+        X_seq_train_tmp, _ = create_sequences(df_scaled, df["Timestamp"], TIME_STEPS_TRAIN)
+        X_tensor_train_tmp = torch.tensor(X_seq_train_tmp, dtype=torch.float32)
+        trained_model.eval()
+        with torch.no_grad():
+            recon_tmp = trained_model(X_tensor_train_tmp)
+        train_mae = np.mean(
+            np.abs(recon_tmp.numpy() - X_tensor_train_tmp.numpy()), axis=(1, 2)
+        )
+        kde_threshold_saved, kde_method_saved, _, _ = compute_kde_threshold(train_mae)
+        print(f"[MLOps] KDE threshold computed: {kde_threshold_saved:.6f} ({kde_method_saved})")
+
+        # Save model artifacts (.pth + scaler + metadata + threshold)
         model_meta = save_model_artifacts(
             trained_model, scaler, model_key, sensors,
-            data_type, epoch_losses, used_feedback=used_feedback
+            data_type, epoch_losses, used_feedback=used_feedback,
+            threshold=kde_threshold_saved, threshold_method=kde_method_saved
         )
 
     # Step 4: Scale data for inference (already done above) and create sequences
@@ -715,9 +784,11 @@ def run_pipeline(file_path, use_feedback=False, force_retrain=False):
     X_seq, timestamps_seq = create_sequences(df_scaled, df["Timestamp"], TIME_STEPS)
     X_tensor = torch.tensor(X_seq, dtype=torch.float32)
 
-    # Step 5: Detect anomalies
-    merged_df, anomalies_df, threshold, mae_scores, per_feature_mae = (
-        detect_anomalies(trained_model, X_tensor, timestamps_seq, df, sensors)
+    # Step 5: Detect anomalies — use saved threshold for stable inference
+    saved_threshold = model_meta.get("threshold") if model_meta else None
+    merged_df, anomalies_df, threshold, mae_scores, per_feature_mae, kde_data = (
+        detect_anomalies(trained_model, X_tensor, timestamps_seq, df, sensors,
+                         saved_threshold=saved_threshold)
     )
 
     # Build JSON-serializable results
@@ -844,6 +915,7 @@ def run_pipeline(file_path, use_feedback=False, force_retrain=False):
         "summary": summary,
         "channels": channels_data,
         "mae_distribution": mae_distribution,
+        "kde_data": kde_data,
         "training_loss": training_loss,
         "anomaly_table": anomaly_table,
         "feature_contribution": feature_contribution,

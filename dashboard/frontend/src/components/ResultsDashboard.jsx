@@ -7,6 +7,7 @@ import ConfidenceDistributionChart from './ConfidenceDistributionChart';
 import AnomalyTable from './AnomalyTable';
 import MetadataPanel from './MetadataPanel';
 import StatisticsPanel from './StatisticsPanel';
+import KDEChart from './KDEChart';
 
 const DATA_TYPE_LABELS = {
   biomass: 'Biomass',
@@ -22,6 +23,7 @@ export default function ResultsDashboard({ data, runId, onRerun }) {
   const tabs = [
     { id: 'overview', label: 'Overview' },
     { id: 'channels', label: 'Sensor Channels' },
+    { id: 'kde', label: 'KDE Threshold' },
     { id: 'diagnostics', label: 'Model Diagnostics' },
     { id: 'table', label: 'Anomaly Log' },
     { id: 'statistics', label: 'Statistics' },
@@ -121,6 +123,7 @@ export default function ResultsDashboard({ data, runId, onRerun }) {
       <div className="fade-in fade-in-delay-3">
         {activeTab === 'overview' && <OverviewTab data={data} />}
         {activeTab === 'channels' && <ChannelsTab data={data} />}
+        {activeTab === 'kde' && <KDETab data={data} />}
         {activeTab === 'diagnostics' && <DiagnosticsTab data={data} />}
         {activeTab === 'table' && (
           <AnomalyTable
@@ -300,6 +303,57 @@ function ChannelStatsGrid({ stats }) {
           </span>
         </div>
       ))}
+    </div>
+  );
+}
+
+function KDETab({ data }) {
+  return (
+    <div className="chart-grid chart-grid--full">
+      <div className="card">
+        <div className="card__header">
+          <span className="card__title">Kernel Density Estimation — Reconstruction Error</span>
+          {data.kde_data && (
+            <span className="card__badge card__badge--red">
+              threshold: {Number(data.kde_data.threshold).toFixed(4)}
+            </span>
+          )}
+        </div>
+        <KDEChart kdeData={data.kde_data} height={380} />
+      </div>
+
+      {/* Side-by-side: MAE histogram + confidence distribution */}
+      <div className="chart-grid">
+        <div className="card">
+          <div className="card__header">
+            <span className="card__title">MAE Score Distribution (Histogram)</span>
+          </div>
+          <MAEDistributionChart data={data.mae_distribution} height={280} />
+        </div>
+        <div className="card">
+          <div className="card__header">
+            <span className="card__title">Anomaly Confidence Distribution</span>
+          </div>
+          <ConfidenceDistributionChart data={data.confidence_distribution} height={280} />
+        </div>
+      </div>
+
+      {/* Threshold info table */}
+      {data.kde_data && (
+        <div className="card">
+          <div className="card__header">
+            <span className="card__title">Threshold Details</span>
+          </div>
+          <div style={{ padding: '8px 0' }}>
+            <ConfigRow label="Active Threshold" value={Number(data.kde_data.threshold).toFixed(6)} />
+            <ConfigRow label="Decision Method" value={data.kde_data.threshold_method} />
+            <ConfigRow label="KDE Natural Valley" value={Number(data.kde_data.kde_threshold).toFixed(6)} />
+            <ConfigRow label="KDE Detection Method" value={data.kde_data.kde_method} />
+            <ConfigRow label="Total Anomalies" value={data.total_anomalies} />
+            <ConfigRow label="Anomaly Rate" value={`${data.anomaly_rate}%`} />
+          </div>
+        </div>
+      )}
     </div>
   );
 }
