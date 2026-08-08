@@ -9,6 +9,9 @@ import uuid
 import json
 import math
 import sqlite3
+import hashlib
+import pickle
+from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 from flask import Flask, request, jsonify, g
@@ -70,14 +73,135 @@ CORS(app)
 
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 FEEDBACK_DIR = os.path.join(os.path.dirname(__file__), "feedback_db")
+MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(FEEDBACK_DIR, exist_ok=True)
+os.makedirs(MODELS_DIR, exist_ok=True)
 
 # Store run results in memory (keyed by run_id)
 results_store = {}
 
 # Known data types (matching folder names in C:\dev\AnomalyDetection\data)
 KNOWN_DATA_TYPES = ["biomass", "cataluminescence", "swiss_roll", "default"]
+
+
+# ====================================================================
+# MODEL PERSISTENCE HELPERS
+# ====================================================================
+def get_model_key(data_type, sensor_cols):
+    """Generate a unique key for a model based on data type and feature set.
+    
+    The key encodes both the data type and a hash of the sorted sensor column
+    names so that data with different channel configurations gets a separate
+    model even within the same data type.
+    """
+    features_str = "|".join(sorted(sensor_cols))
+    features_hash = hashlib.md5(features_str.encode()).hexdigest()[:8]
+    return f"{data_type}_{len(sensor_cols)}ch_{features_hash}"
+
+
+def get_model_paths(model_key):
+    """Return paths for the .pth weights, scaler pickle, and metadata JSON."""
+    base = os.path.join(MODELS_DIR, model_key)
+    return {
+        "weights": f"{base}.pth",
+        "scaler": f"{base}_scaler.pkl",
+        "meta": f"{base}_meta.json",
+    }
+
+
+def save_model_artifacts(model, scaler, model_key, sensor_cols,
+                         data_type, epoch_losses, used_feedback=False):
+    """Persist model weights, fitted scaler, and training metadata locally."""
+    paths = get_model_paths(model_key)
+
+    # Save PyTorch model weights
+    torch.save(model.state_dict(), paths["weights"])
+
+    # Save fitted StandardScaler
+    with open(paths["scaler"], "wb") as f:
+        pickle.dump(scaler, f)
+
+    # Save metadata
+    meta = {
+        "model_key": model_key,
+        "data_type": data_type,
+        "num_features": len(sensor_cols),
+        "sensor_columns": sensor_cols,
+        "hidden_size": min(64, max(16, len(sensor_cols) * 4)),
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+        "num_epochs": len(epoch_losses),
+        "final_loss": epoch_losses[-1] if epoch_losses else None,
+        "used_feedback": used_feedback,
+    }
+    with open(paths["meta"], "w") as f:
+        json.dump(meta, f, indent=2)
+
+    print(f"[MLOps] Saved model artifacts: {model_key}")
+    return meta
+
+
+def load_model_artifacts(model_key, num_features):
+    """Load a previously saved model and scaler.
+    
+    Returns (model, scaler, metadata) or (None, None, None) if not found.
+    """
+    paths = get_model_paths(model_key)
+
+    if not os.path.exists(paths["weights"]):
+        return None, None, None
+
+    try:
+        # Reconstruct model architecture and load weights
+        model = DynamicLSTMAutoencoder(num_features=num_features)
+        model.load_state_dict(torch.load(paths["weights"], weights_only=True))
+        model.eval()
+
+        # Load scaler
+        with open(paths["scaler"], "rb") as f:
+            scaler = pickle.load(f)
+
+        # Load metadata
+        meta = {}
+        if os.path.exists(paths["meta"]):
+            with open(paths["meta"], "r") as f:
+                meta = json.load(f)
+
+        print(f"[MLOps] Loaded saved model: {model_key}")
+        return model, scaler, meta
+
+    except Exception as e:
+        print(f"[MLOps] Failed to load model {model_key}: {e}")
+        return None, None, None
+
+
+def list_saved_models():
+    """List all saved models with their metadata."""
+    models = []
+    for fname in os.listdir(MODELS_DIR):
+        if fname.endswith("_meta.json"):
+            try:
+                with open(os.path.join(MODELS_DIR, fname), "r") as f:
+                    meta = json.load(f)
+                # Check that weights file still exists
+                paths = get_model_paths(meta["model_key"])
+                meta["weights_exist"] = os.path.exists(paths["weights"])
+                meta["scaler_exists"] = os.path.exists(paths["scaler"])
+                models.append(meta)
+            except Exception:
+                pass
+    return models
+
+
+def delete_model_artifacts(model_key):
+    """Delete all artifacts for a given model key."""
+    paths = get_model_paths(model_key)
+    deleted = []
+    for name, path in paths.items():
+        if os.path.exists(path):
+            os.remove(path)
+            deleted.append(name)
+    return deleted
 
 
 # ====================================================================
@@ -501,8 +625,14 @@ def detect_anomalies(
     return merged_df, anomalies_only, threshold, mae_loss, per_feature_mae
 
 
-def run_pipeline(file_path, use_feedback=False):
-    """Execute the full anomaly detection pipeline and return structured results."""
+def run_pipeline(file_path, use_feedback=False, force_retrain=False):
+    """Execute the full anomaly detection pipeline and return structured results.
+    
+    MLOps flow:
+    - If a saved .pth model exists for this data type + feature set → load it (no training)
+    - If no saved model exists → train from scratch and save .pth
+    - If force_retrain=True → retrain (incorporating feedback) and overwrite .pth
+    """
     file_name = os.path.basename(file_path)
 
     # Step 1: Load data
@@ -516,36 +646,74 @@ def run_pipeline(file_path, use_feedback=False):
     # Step 1c: Extract instrument metadata (if available)
     metadata = extract_instrument_metadata(file_path)
 
-    # Step 2: Scale
-    scaler = StandardScaler()
-    df_scaled = pd.DataFrame(scaler.fit_transform(df[sensors]), columns=sensors)
+    # Step 2: Compute model key for persistence lookup
+    model_key = get_model_key(data_type, sensors)
+    model_trained = False
+    epoch_losses = []
+    model_meta = None
 
-    # Step 3: Create sequences
-    TIME_STEPS = 10
-    X_seq, timestamps_seq = create_sequences(df_scaled, df["Timestamp"], TIME_STEPS)
-    X_tensor = torch.tensor(X_seq, dtype=torch.float32)
+    # Step 3: Try to load a saved model (skip training)
+    if not force_retrain:
+        saved_model, saved_scaler, model_meta = load_model_artifacts(
+            model_key, num_features=len(sensors)
+        )
+    else:
+        saved_model, saved_scaler = None, None
 
-    dataset = TensorDataset(X_tensor)
-    train_loader = DataLoader(dataset, batch_size=16, shuffle=False)
+    if saved_model is not None and saved_scaler is not None:
+        # ── USE SAVED MODEL (no training) ──
+        print(f"[MLOps] Using saved model for inference: {model_key}")
+        trained_model = saved_model
+        scaler = saved_scaler
 
-    # Step 4: Build and train model
-    model = DynamicLSTMAutoencoder(num_features=len(sensors))
+        # Scale data using the SAVED scaler (must match training distribution)
+        df_scaled = pd.DataFrame(scaler.transform(df[sensors]), columns=sensors)
+    else:
+        # ── TRAIN NEW MODEL ──
+        print(f"[MLOps] No saved model found (or retrain forced). Training: {model_key}")
+        model_trained = True
 
-    if use_feedback and data_type != "unknown":
-        confirmed_normal = get_confirmed_normal_timestamps(data_type)
-        if confirmed_normal:
-            trained_model, epoch_losses = train_with_feedback(
-                model, train_loader, X_tensor, timestamps_seq,
-                confirmed_normal, num_epochs=30
-            )
+        # Fit a fresh scaler on this data
+        scaler = StandardScaler()
+        df_scaled = pd.DataFrame(scaler.fit_transform(df[sensors]), columns=sensors)
+
+        # Create sequences for training
+        TIME_STEPS = 10
+        X_seq_train, ts_train = create_sequences(df_scaled, df["Timestamp"], TIME_STEPS)
+        X_tensor_train = torch.tensor(X_seq_train, dtype=torch.float32)
+        dataset_train = TensorDataset(X_tensor_train)
+        train_loader = DataLoader(dataset_train, batch_size=16, shuffle=False)
+
+        model = DynamicLSTMAutoencoder(num_features=len(sensors))
+        used_feedback = False
+
+        if (use_feedback or force_retrain) and data_type != "unknown":
+            confirmed_normal = get_confirmed_normal_timestamps(data_type)
+            if confirmed_normal:
+                trained_model, epoch_losses = train_with_feedback(
+                    model, train_loader, X_tensor_train, ts_train,
+                    confirmed_normal, num_epochs=30
+                )
+                used_feedback = True
+            else:
+                trained_model, epoch_losses = train_autoencoder(
+                    model, train_loader, num_epochs=30
+                )
         else:
             trained_model, epoch_losses = train_autoencoder(
                 model, train_loader, num_epochs=30
             )
-    else:
-        trained_model, epoch_losses = train_autoencoder(
-            model, train_loader, num_epochs=30
+
+        # Save model artifacts (.pth + scaler + metadata)
+        model_meta = save_model_artifacts(
+            trained_model, scaler, model_key, sensors,
+            data_type, epoch_losses, used_feedback=used_feedback
         )
+
+    # Step 4: Scale data for inference (already done above) and create sequences
+    TIME_STEPS = 10
+    X_seq, timestamps_seq = create_sequences(df_scaled, df["Timestamp"], TIME_STEPS)
+    X_tensor = torch.tensor(X_seq, dtype=torch.float32)
 
     # Step 5: Detect anomalies
     merged_df, anomalies_df, threshold, mae_scores, per_feature_mae = (
@@ -658,6 +826,17 @@ def run_pipeline(file_path, use_feedback=False):
         for fb in fb_entries:
             existing_feedback[fb["timestamp"]] = fb["is_true_anomaly"]
 
+    # Build model_info for the response
+    model_info = {
+        "model_key": model_key,
+        "model_trained_this_run": model_trained,
+        "loaded_from_cache": not model_trained,
+        "trained_at": model_meta.get("trained_at") if model_meta else None,
+        "num_epochs": model_meta.get("num_epochs") if model_meta else len(epoch_losses),
+        "final_loss": model_meta.get("final_loss") if model_meta else (epoch_losses[-1] if epoch_losses else None),
+        "used_feedback": model_meta.get("used_feedback", False) if model_meta else False,
+    }
+
     return {
         "file_name": file_name,
         "data_type": data_type,
@@ -674,7 +853,8 @@ def run_pipeline(file_path, use_feedback=False):
         "total_points": len(merged_df),
         "anomaly_rate": round(len(anomalies_df) / max(len(merged_df), 1) * 100, 2),
         "existing_feedback": existing_feedback,
-        "used_feedback": use_feedback,
+        "used_feedback": model_info["used_feedback"],
+        "model_info": model_info,
     }
 
 
@@ -798,6 +978,64 @@ def get_results(run_id):
     if run_id not in results_store:
         return jsonify({"error": "Run not found"}), 404
     return jsonify(results_store[run_id])
+
+
+# ====================================================================
+# MODEL MANAGEMENT API ROUTES
+# ====================================================================
+@app.route("/api/retrain", methods=["POST"])
+def retrain_model():
+    """Force retrain the model for a given CSV, incorporating latest feedback.
+    
+    This deletes the cached .pth and retrains from scratch with feedback-aware
+    training (upweighting confirmed-normal timestamps).
+    """
+    data = request.get_json()
+    file_path = data.get("path")
+
+    if not file_path or not os.path.exists(file_path):
+        return jsonify({"error": "File not found"}), 400
+
+    try:
+        results = sanitize(
+            run_pipeline(file_path, use_feedback=True, force_retrain=True)
+        )
+        run_id = str(uuid.uuid4())
+        results_store[run_id] = results
+        return jsonify({
+            "run_id": run_id,
+            "results": results,
+            "message": "Model retrained successfully with latest feedback",
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/models", methods=["GET"])
+def get_models():
+    """List all saved model artifacts with their metadata."""
+    try:
+        models = list_saved_models()
+        return jsonify({"models": models, "models_dir": MODELS_DIR})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/models/<model_key>", methods=["DELETE"])
+def delete_model(model_key):
+    """Delete a saved model (forces retrain on next run)."""
+    try:
+        deleted = delete_model_artifacts(model_key)
+        if deleted:
+            return jsonify({
+                "message": f"Deleted model artifacts: {', '.join(deleted)}",
+                "model_key": model_key,
+            })
+        else:
+            return jsonify({"error": "No artifacts found for this model key"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
