@@ -18,6 +18,8 @@ from measurement_contract import (
     QualityClass,
     QualityFlag,
 )
+from physical_configuration import ChannelPhysicalConfiguration
+from physics_detector import PhysicsDetector
 
 
 class EdgeStateStore:
@@ -89,6 +91,7 @@ class EdgeProcessor:
         max31856_limits: dict[str, float] | None = None,
         rom_manifests: dict[str, set[str] | list[str]] | None = None,
         rom_manifest_check_interval: int = 60,
+        physical_configurations: dict[str, ChannelPhysicalConfiguration] | None = None,
     ):
         self.state_store = state_store
         self.ruleset_version = ruleset_version
@@ -103,12 +106,24 @@ class EdgeProcessor:
             for device_id, rom_ids in (rom_manifests or {}).items()
         }
         self.rom_manifest_check_interval = max(1, rom_manifest_check_interval)
+        self.physical_configurations = physical_configurations or {}
+        self.physics_detector = PhysicsDetector()
 
     def process(self, record: MeasurementRecord) -> MeasurementRecord:
         state = self.state_store.load(record.device_id, record.channel_id)
         flags = list(record.quality_flags)
         flags.extend(self._timing_flags(record, state))
         flags.extend(self._integrity_flags(record, state))
+        configuration = self.physical_configurations.get(record.channel_id)
+        if configuration is not None:
+            flags.extend(
+                self.physics_detector.evaluate(
+                    record,
+                    configuration,
+                    state,
+                    existing_flags=flags,
+                )
+            )
         unique_flags = {flag.code: flag for flag in flags}
         flagged_record = record.model_copy(
             update={"quality_flags": tuple(unique_flags.values())}

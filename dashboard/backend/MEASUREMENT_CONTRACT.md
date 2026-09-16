@@ -75,3 +75,17 @@ Timing fields are carried in `MeasurementRecord.timing`: monotonic conversion st
 `physical_configuration.py` defines the channel configuration published to an edge node. It includes sensor and front-end identity, junction style, probe geometry and installation, measured thermal time constant and uncertainty, physical bounds, source/sink limits, noise floor, acquisition interval, datasheet resolution, thermocouple tolerance class, board/node identity, and related fast/slow sensor pairs.
 
 The model accepts only measured-$\\tau$ provenance (`commissioning_step`, `online_transient_fit`, or both). A catalogue default is intentionally invalid. Publish it through `PUT /api/devices/<device_id>/channels/<channel_id>/physical-config`; retrieve the active version with the corresponding `GET` endpoint.
+
+## Physics detector order
+
+`physics_detector.py` applies the PDF sequence after the existing hardware signal-integrity checks:
+
+1. Thermodynamic bounds using channel and source/sink limits.
+2. Per-channel slope limit using measured `thermal_time_constant_seconds` and its uncertainty.
+3. Cold-soak agreement when `event_metadata.attributes` contains `cold_soak_active` and `cold_soak_reference_c`.
+4. High-pass RMS or supplied `raw_register_data["high_pass_rms"]`, compared with the configured noise floor and resolution.
+5. Two-sensor timing/residual checks using explicit peer timing metadata or a peer record.
+6. Online first-order time-constant fitting and drift annotation.
+7. CUSUM-like drift accumulation only inside explicitly marked `quiescent_window` intervals.
+
+The edge layer runs signal-integrity checks first, then adds these physics flags without changing `raw_value`. Hard violations are `implausible`; degradation signatures are `suspicious`; high-pass or residual surprises that remain physically possible are `unusual` annotations.
