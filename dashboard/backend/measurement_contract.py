@@ -7,7 +7,7 @@ from enum import StrEnum
 from typing import Any, Mapping
 from typing_extensions import Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 MEASUREMENT_SCHEMA_VERSION = "1.0"
@@ -67,6 +67,48 @@ class EventMetadata(BaseModel):
     attributes: Mapping[str, Any] = Field(default_factory=dict)
 
 
+class TimingMetadata(BaseModel):
+    """Acquisition timing facts; monotonic time drives calculations."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    conversion_started_monotonic_seconds: float | None = Field(default=None, ge=0)
+    conversion_completed_monotonic_seconds: float | None = Field(default=None, ge=0)
+    conversion_delay_seconds: float | None = Field(default=None, ge=0)
+    conversion_completed: bool | None = None
+    source_timestamp_offset_seconds: float = 0.0
+    cross_sensor_offset_seconds: float = 0.0
+
+    @model_validator(mode="after")
+    def validate_conversion_order(self) -> "TimingMetadata":
+        if (
+            self.conversion_started_monotonic_seconds is not None
+            and self.conversion_completed_monotonic_seconds is not None
+            and self.conversion_completed_monotonic_seconds
+            < self.conversion_started_monotonic_seconds
+        ):
+            raise ValueError("conversion completion cannot precede conversion start")
+        return self
+
+
+class IntervalStatistics(BaseModel):
+    """Summary of raw oversamples within one transmitted interval."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    sample_count: int = Field(ge=1)
+    mean: float
+    minimum: float
+    maximum: float
+    standard_deviation: float = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> "IntervalStatistics":
+        if self.minimum > self.maximum or not self.minimum <= self.mean <= self.maximum:
+            raise ValueError("interval statistics bounds are inconsistent")
+        return self
+
+
 class MeasurementRecord(BaseModel):
     """One raw sensor sample plus immutable context and additive quality flags."""
 
@@ -89,6 +131,8 @@ class MeasurementRecord(BaseModel):
     detector_ruleset_version: str = Field(min_length=1)
     parameter_set_version: str = Field(min_length=1)
     event_metadata: EventMetadata = Field(default_factory=EventMetadata)
+    timing: TimingMetadata = Field(default_factory=TimingMetadata)
+    interval_statistics: IntervalStatistics | None = None
 
     @field_validator("wall_clock_timestamp")
     @classmethod

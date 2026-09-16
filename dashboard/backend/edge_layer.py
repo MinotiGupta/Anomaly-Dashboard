@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
+import statistics
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +13,7 @@ from typing import Any
 
 from measurement_contract import (
     FrontEndType,
+    IntervalStatistics,
     MeasurementRecord,
     QualityClass,
     QualityFlag,
@@ -104,6 +107,7 @@ class EdgeProcessor:
     def process(self, record: MeasurementRecord) -> MeasurementRecord:
         state = self.state_store.load(record.device_id, record.channel_id)
         flags = list(record.quality_flags)
+        flags.extend(self._timing_flags(record, state))
         flags.extend(self._integrity_flags(record, state))
         unique_flags = {flag.code: flag for flag in flags}
         flagged_record = record.model_copy(
@@ -122,10 +126,93 @@ class EdgeProcessor:
                 "ruleset_version": self.ruleset_version,
             }
         )
+        state["boot_ids_seen"] = sorted(
+            set(state.get("boot_ids_seen", [])) | {record.boot_id}
+        )
+        state["last_conversion_completed"] = record.timing.conversion_completed
+        state["last_cross_sensor_offset_seconds"] = record.timing.cross_sensor_offset_seconds
         self._update_integrity_state(state, record, flagged_record)
         self.state_store.save(record.device_id, record.channel_id, state)
         self.state_store.enqueue(flagged_record)
         return flagged_record
+
+    @staticmethod
+    def summarize_interval(raw_values: list[float] | tuple[float, ...]) -> IntervalStatistics:
+        """Summarize raw oversamples without changing or discarding them."""
+        if not raw_values:
+            raise ValueError("at least one raw oversample is required")
+        values = [float(value) for value in raw_values]
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("oversamples must be finite")
+        return IntervalStatistics(
+            sample_count=len(values),
+            mean=statistics.fmean(values),
+            minimum=min(values),
+            maximum=max(values),
+            standard_deviation=statistics.stdev(values) if len(values) > 1 else 0.0,
+        )
+
+    def _timing_flags(
+        self, record: MeasurementRecord, state: dict[str, Any]
+    ) -> list[QualityFlag]:
+        flags = []
+        previous_boot = state.get("boot_id")
+        previous_uptime = state.get("last_monotonic_uptime_seconds")
+        if previous_boot is not None and previous_boot != record.boot_id:
+            flags.append(
+                self._flag(
+                    "boot_id_changed",
+                    QualityClass.SUSPICIOUS,
+                    "Device boot ID changed; detector state continuity crosses a restart",
+                    "monotonic_timing",
+                    record,
+                )
+            )
+        if previous_boot == record.boot_id and previous_uptime is not None:
+            delta = record.monotonic_uptime_seconds - float(previous_uptime)
+            if delta <= 0:
+                flags.append(
+                    self._flag(
+                        "monotonic_timestamp_regression",
+                        QualityClass.IMPLAUSIBLE,
+                        "Monotonic uptime did not advance within a boot session",
+                        "monotonic_timing",
+                        record,
+                    )
+                )
+            elif abs(delta - record.sample_interval_seconds) > max(
+                0.05, record.sample_interval_seconds * 0.25
+            ):
+                flags.append(
+                    self._flag(
+                        "sample_interval_mismatch",
+                        QualityClass.SUSPICIOUS,
+                        "Declared sample interval differs from monotonic elapsed time",
+                        "monotonic_timing",
+                        record,
+                    )
+                )
+        timing = record.timing
+        if (
+            timing.conversion_started_monotonic_seconds is not None
+            and timing.conversion_completed_monotonic_seconds is not None
+            and timing.conversion_delay_seconds is not None
+        ):
+            actual_delay = (
+                timing.conversion_completed_monotonic_seconds
+                - timing.conversion_started_monotonic_seconds
+            )
+            if abs(actual_delay - timing.conversion_delay_seconds) > 0.01:
+                flags.append(
+                    self._flag(
+                        "conversion_delay_mismatch",
+                        QualityClass.SUSPICIOUS,
+                        "Declared DS18B20 conversion delay differs from monotonic timing",
+                        "conversion_timing",
+                        record,
+                    )
+                )
+        return flags
 
     def _integrity_flags(
         self, record: MeasurementRecord, state: dict[str, Any]
