@@ -84,9 +84,7 @@ class MeasurementRecord(BaseModel):
     front_end_type: FrontEndType
     sample_interval_seconds: float = Field(gt=0)
     raw_hardware_word: int | None = None
-    raw_register_data: Mapping[str, int | float | str | bool | None] = Field(
-        default_factory=dict
-    )
+    raw_register_data: Mapping[str, Any] = Field(default_factory=dict)
     quality_flags: tuple[QualityFlag, ...] = ()
     detector_ruleset_version: str = Field(min_length=1)
     parameter_set_version: str = Field(min_length=1)

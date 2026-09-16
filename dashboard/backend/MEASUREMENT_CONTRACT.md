@@ -57,3 +57,13 @@ flagged = record.with_quality_flags(
 ```
 
 The existing CSV pipeline does not yet provide all hardware provenance fields. Until acquisition is upgraded, missing hardware fields should remain empty or explicitly marked `unknown`; they must not be inferred as valid hardware state.
+
+## Edge integrity payloads
+
+The edge processor reads these optional `raw_register_data` fields when the corresponding hardware is present:
+
+- MAX31855: `duplicate_read_word` or `duplicate_read_words`, `fault_summary`, `fault_open`, `fault_short_vcc`, `fault_short_gnd`.
+- MAX31856: individual fault fields such as `open_thermocouple`, `over_voltage`, and `under_voltage`; `thermocouple_temperature`; `cold_junction_temperature`; `expected_configuration`; `configuration_readback`; and `configuration_reset`.
+- DS18B20: `scratchpad_bytes`, `rom_id`, `expected_rom_id`, and `bus_rom_ids`.
+
+MAX31855 reserved bits are checked using the documented reserved-bit mask, and the processor records that this interface has no CRC or parity. DS18B20 scratchpad CRC-8 is calculated locally. A configured `rom_manifests` map on `EdgeProcessor` verifies the complete bus topology at the configured periodic interval. None of these checks alter `raw_value`.
