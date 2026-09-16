@@ -21,6 +21,7 @@ from measurement_contract import (
 from physical_configuration import ChannelPhysicalConfiguration
 from physics_detector import PhysicsDetector
 from quality_policy import enforce_flag_authority
+from thermal_bias import ThermalBiasAnalyzer
 
 
 class EdgeStateStore:
@@ -109,6 +110,7 @@ class EdgeProcessor:
         self.rom_manifest_check_interval = max(1, rom_manifest_check_interval)
         self.physical_configurations = physical_configurations or {}
         self.physics_detector = PhysicsDetector()
+        self.thermal_bias_analyzer = ThermalBiasAnalyzer()
 
     def process(self, record: MeasurementRecord) -> MeasurementRecord:
         state = self.state_store.load(record.device_id, record.channel_id)
@@ -125,10 +127,16 @@ class EdgeProcessor:
                     existing_flags=flags,
                 )
             )
+            diagnostics = self.thermal_bias_analyzer.analyze(record, configuration, state)
+        else:
+            diagnostics = []
         unique_flags = {flag.code: flag for flag in flags}
         authoritative_flags = enforce_flag_authority(unique_flags.values())
         flagged_record = record.model_copy(
-            update={"quality_flags": authoritative_flags}
+            update={
+                "quality_flags": authoritative_flags,
+                "diagnostics": record.diagnostics + tuple(diagnostics),
+            }
         )
         state.update(
             {

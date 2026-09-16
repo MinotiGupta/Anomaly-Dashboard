@@ -164,6 +164,7 @@ class DashboardStore:
     def diagnostics(self, device_id: str) -> dict[str, Any]:
         records = self.list_measurements(device_id)
         flags: list[dict[str, Any]] = []
+        diagnostics: list[dict[str, Any]] = []
         for record in records:
             for flag in record.quality_flags:
                 flags.append(
@@ -172,6 +173,15 @@ class DashboardStore:
                         "channel_id": record.channel_id,
                         "timestamp": record.wall_clock_timestamp.isoformat(),
                         **flag.model_dump(mode="json"),
+                    }
+                )
+            for annotation in record.diagnostics:
+                diagnostics.append(
+                    {
+                        "measurement_id": record.measurement_id,
+                        "channel_id": record.channel_id,
+                        "timestamp": record.wall_clock_timestamp.isoformat(),
+                        **annotation.model_dump(mode="json"),
                     }
                 )
         summary = {"implausible": 0, "suspicious": 0, "unusual": 0}
@@ -185,7 +195,9 @@ class DashboardStore:
             "flag_count": len(flags),
             "quality_summary": summary,
             "raw_records_retained": True,
+            "diagnostic_count": len(diagnostics),
             "flags": flags,
+            "diagnostics": diagnostics,
         }
 
     def list_science_measurements(

@@ -99,3 +99,9 @@ Every `QualityFlag` requires one of the three classes. `quality_policy.py` enfor
 - `unusual` means a statistically surprising but physically valid observation. It is never suppressed.
 
 Raw records are always retained and are available through `GET /api/measurements/<device_id>`. The derived `GET /api/measurements/<device_id>/science` endpoint excludes only records carrying an `implausible` flag. Statistical detector sources such as autoencoders, KDE, and reconstruction-error logic are normalized to `unusual` if they attempt to emit a stronger class.
+
+## Thermal-bias diagnostics
+
+`thermal_bias.py` emits separate `diagnostics` annotations for expected measurement effects. It can annotate radiation error from `wall_temperature_c`, `heat_transfer_coefficient_w_m2k`, and emissivity; conduction error from mount temperature and probe geometry; recovery heating from `gas_velocity_m_s`; thermocouple inhomogeneity from repositioning or temperature-band evidence; cold-junction drift from board-temperature movement; MAX31855 linearisation differences from `max31855_linearisation_difference_c`; and junction-style effects from the channel configuration.
+
+These annotations are explanatory only. They do not create `QualityFlag` values, do not change `raw_value`, and do not exclude records from the science view.

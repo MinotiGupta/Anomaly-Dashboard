@@ -54,6 +54,26 @@ class QualityFlag(BaseModel):
         return value
 
 
+class DiagnosticAnnotation(BaseModel):
+    """Explanatory physical effect; never an anomaly or science veto."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    code: str = Field(min_length=1, pattern=r"^[a-z0-9_]+$")
+    message: str = Field(min_length=1)
+    detector: str = Field(min_length=1)
+    estimated_bias_c: float | None = None
+    evidence: Mapping[str, Any] = Field(default_factory=dict)
+    annotated_at: datetime
+
+    @field_validator("annotated_at")
+    @classmethod
+    def require_aware_annotation_timestamp(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("annotated_at must include timezone information")
+        return value
+
+
 class EventMetadata(BaseModel):
     """Process state captured alongside a measurement when available."""
 
@@ -133,6 +153,7 @@ class MeasurementRecord(BaseModel):
     event_metadata: EventMetadata = Field(default_factory=EventMetadata)
     timing: TimingMetadata = Field(default_factory=TimingMetadata)
     interval_statistics: IntervalStatistics | None = None
+    diagnostics: tuple[DiagnosticAnnotation, ...] = ()
 
     @field_validator("wall_clock_timestamp")
     @classmethod
@@ -154,6 +175,12 @@ class MeasurementRecord(BaseModel):
     def with_quality_flags(self, *flags: QualityFlag) -> Self:
         """Return a new record with flags appended; raw fields remain unchanged."""
         return self.model_copy(update={"quality_flags": self.quality_flags + tuple(flags)})
+
+    def with_diagnostics(self, *annotations: DiagnosticAnnotation) -> Self:
+        """Return a new record with explanatory annotations appended."""
+        return self.model_copy(
+            update={"diagnostics": self.diagnostics + tuple(annotations)}
+        )
 
     def raw_payload(self) -> dict[str, Any]:
         """Serialize the complete record for transport or durable storage."""
