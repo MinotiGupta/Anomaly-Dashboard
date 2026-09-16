@@ -25,6 +25,8 @@ from torch.utils.data import TensorDataset, DataLoader
 from scipy.stats import gaussian_kde
 from scipy.signal import argrelextrema
 import traceback
+from dashboard_store import DashboardStore
+from measurement_contract import MeasurementRecord
 
 
 # ====================================================================
@@ -76,9 +78,11 @@ CORS(app)
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 FEEDBACK_DIR = os.path.join(os.path.dirname(__file__), "feedback_db")
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
+DASHBOARD_DB = os.path.join(os.path.dirname(__file__), "dashboard_data.db")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(FEEDBACK_DIR, exist_ok=True)
 os.makedirs(MODELS_DIR, exist_ok=True)
+dashboard_store = DashboardStore(DASHBOARD_DB)
 
 # Store run results in memory (keyed by run_id)
 results_store = {}
@@ -1050,6 +1054,94 @@ def get_results(run_id):
     if run_id not in results_store:
         return jsonify({"error": "Run not found"}), 404
     return jsonify(results_store[run_id])
+
+
+# ====================================================================
+# EDGE/CLOUD MEASUREMENT API
+# ====================================================================
+@app.route("/api/measurements", methods=["POST"])
+def ingest_measurements():
+    """Receive raw edge records without changing their values or flags."""
+    payload = request.get_json(silent=True) or {}
+    raw_records = payload.get("records", [])
+    if not isinstance(raw_records, list) or not raw_records:
+        return jsonify({"error": "records must be a non-empty list"}), 400
+
+    try:
+        records = [MeasurementRecord.model_validate(item) for item in raw_records]
+        stored = dashboard_store.ingest_many(records, run_id=payload.get("run_id"))
+        return jsonify({
+            "received": len(records),
+            "stored": stored,
+            "duplicates": len(records) - stored,
+        }), 202
+    except Exception as exc:
+        return jsonify({"error": f"Invalid measurement payload: {exc}"}), 400
+
+
+@app.route("/api/measurements/<device_id>", methods=["GET"])
+def get_measurements(device_id):
+    """Return raw measurements and additive quality flags for a device."""
+    channel_id = request.args.get("channel_id")
+    try:
+        records = dashboard_store.list_measurements(device_id, channel_id=channel_id)
+        return jsonify({
+            "device_id": device_id,
+            "records": [record.raw_payload() for record in records],
+        })
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/diagnostics/<device_id>", methods=["GET"])
+def get_device_diagnostics(device_id):
+    return jsonify(dashboard_store.diagnostics(device_id))
+
+
+@app.route("/api/analytics/<device_id>/parameters", methods=["GET"])
+def fit_device_parameters(device_id):
+    """Fit interpretable channel parameters from stored measurements."""
+    return jsonify({
+        "device_id": device_id,
+        "parameters": dashboard_store.fit_channel_parameters(device_id),
+    })
+
+
+@app.route("/api/edge-config/<device_id>", methods=["GET"])
+def get_edge_configuration(device_id):
+    config = dashboard_store.get_configuration(
+        device_id, request.args.get("config_version")
+    )
+    if config is None:
+        return jsonify({"error": "No configuration found"}), 404
+    return jsonify(config)
+
+
+@app.route("/api/edge-config/<device_id>", methods=["PUT"])
+def save_edge_configuration(device_id):
+    payload = request.get_json(silent=True) or {}
+    required = [
+        "config_version",
+        "ruleset_version",
+        "parameter_set_version",
+        "configuration",
+    ]
+    missing = [field for field in required if field not in payload]
+    if missing or not isinstance(payload.get("configuration"), dict):
+        return jsonify({
+            "error": "Missing required configuration fields",
+            "missing": missing,
+        }), 400
+    dashboard_store.save_configuration(
+        device_id=device_id,
+        config_version=payload["config_version"],
+        ruleset_version=payload["ruleset_version"],
+        parameter_set_version=payload["parameter_set_version"],
+        configuration=payload["configuration"],
+    )
+    return jsonify(dashboard_store.get_configuration(
+        device_id, payload["config_version"]
+    )), 201
 
 
 # ====================================================================
