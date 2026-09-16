@@ -1,0 +1,59 @@
+# Measurement Contract v1.0
+
+`measurement_contract.py` defines the canonical representation of one sensor sample.
+
+## Required behavior
+
+- `raw_value` is the value received from the device and is always retained.
+- `wall_clock_timestamp` must be timezone-aware and is used for storage and display.
+- `monotonic_uptime_seconds` is used for rate and interval calculations.
+- `boot_id` allows resets and data gaps to be detected.
+- Device, channel, sensor, and front-end identities are explicit.
+- Hardware words and register data are preserved when available.
+- Detector and parameter versions make results reproducible.
+- Process state is carried in `event_metadata`.
+- `quality_flags` are additive annotations.
+
+`MeasurementRecord` is immutable. Detector code must call `with_quality_flags()` to create a new record. It must not modify, clamp, smooth, substitute, or delete the raw sample.
+
+## Example
+
+```python
+from datetime import datetime, timezone
+
+from measurement_contract import (
+    FrontEndType,
+    MeasurementRecord,
+    QualityClass,
+    QualityFlag,
+    SensorType,
+)
+
+record = MeasurementRecord(
+    measurement_id="node-1/boot-7/42",
+    raw_value=85.0,
+    wall_clock_timestamp=datetime.now(timezone.utc),
+    monotonic_uptime_seconds=42.5,
+    boot_id="boot-7",
+    device_id="node-1",
+    channel_id="probe-1",
+    sensor_type=SensorType.DS18B20,
+    front_end_type=FrontEndType.DS18B20_1WIRE,
+    sample_interval_seconds=1.0,
+    raw_register_data={"scratchpad_crc_ok": False},
+    detector_ruleset_version="ruleset-1",
+    parameter_set_version="parameters-1",
+)
+
+flagged = record.with_quality_flags(
+    QualityFlag(
+        code="crc_failure",
+        classification=QualityClass.IMPLAUSIBLE,
+        message="Scratchpad CRC failed",
+        detector="ds18b20_crc",
+        detected_at=datetime.now(timezone.utc),
+    )
+)
+```
+
+The existing CSV pipeline does not yet provide all hardware provenance fields. Until acquisition is upgraded, missing hardware fields should remain empty or explicitly marked `unknown`; they must not be inferred as valid hardware state.
