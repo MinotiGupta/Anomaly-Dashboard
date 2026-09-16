@@ -89,3 +89,13 @@ The model accepts only measured-$\\tau$ provenance (`commissioning_step`, `onlin
 7. CUSUM-like drift accumulation only inside explicitly marked `quiescent_window` intervals.
 
 The edge layer runs signal-integrity checks first, then adds these physics flags without changing `raw_value`. Hard violations are `implausible`; degradation signatures are `suspicious`; high-pass or residual surprises that remain physically possible are `unusual` annotations.
+
+## Quality-class authority
+
+Every `QualityFlag` requires one of the three classes. `quality_policy.py` enforces the authority boundary:
+
+- `implausible` means a hard hardware or physics violation. It is the only class that can exclude a record from the derived science view.
+- `suspicious` means a degradation or maintenance signature. The record remains in the science view and is surfaced as a diagnostic.
+- `unusual` means a statistically surprising but physically valid observation. It is never suppressed.
+
+Raw records are always retained and are available through `GET /api/measurements/<device_id>`. The derived `GET /api/measurements/<device_id>/science` endpoint excludes only records carrying an `implausible` flag. Statistical detector sources such as autoencoders, KDE, and reconstruction-error logic are normalized to `unusual` if they attempt to emit a stronger class.

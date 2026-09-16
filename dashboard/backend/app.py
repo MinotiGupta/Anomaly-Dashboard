@@ -1094,6 +1094,20 @@ def get_measurements(device_id):
         return jsonify({"error": str(exc)}), 500
 
 
+@app.route("/api/measurements/<device_id>/science", methods=["GET"])
+def get_science_measurements(device_id):
+    """Return the derived science view; raw measurements remain available above."""
+    channel_id = request.args.get("channel_id")
+    records = dashboard_store.list_science_measurements(
+        device_id, channel_id=channel_id
+    )
+    return jsonify({
+        "device_id": device_id,
+        "records": [record.raw_payload() for record in records],
+        "raw_records_retained": True,
+    })
+
+
 @app.route("/api/diagnostics/<device_id>", methods=["GET"])
 def get_device_diagnostics(device_id):
     return jsonify(dashboard_store.diagnostics(device_id))

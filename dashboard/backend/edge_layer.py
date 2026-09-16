@@ -20,6 +20,7 @@ from measurement_contract import (
 )
 from physical_configuration import ChannelPhysicalConfiguration
 from physics_detector import PhysicsDetector
+from quality_policy import enforce_flag_authority
 
 
 class EdgeStateStore:
@@ -125,8 +126,9 @@ class EdgeProcessor:
                 )
             )
         unique_flags = {flag.code: flag for flag in flags}
+        authoritative_flags = enforce_flag_authority(unique_flags.values())
         flagged_record = record.model_copy(
-            update={"quality_flags": tuple(unique_flags.values())}
+            update={"quality_flags": authoritative_flags}
         )
         state.update(
             {
@@ -136,7 +138,7 @@ class EdgeProcessor:
                 "last_wall_clock_timestamp": record.wall_clock_timestamp.isoformat(),
                 "measurement_count": int(state.get("measurement_count", 0)) + 1,
                 "flag_count": int(state.get("flag_count", 0)) + len(
-                    tuple(unique_flags.values())
+                    authoritative_flags
                 ),
                 "ruleset_version": self.ruleset_version,
             }

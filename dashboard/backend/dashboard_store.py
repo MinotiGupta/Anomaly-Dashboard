@@ -11,6 +11,7 @@ from typing import Any, Iterable
 
 from measurement_contract import MeasurementRecord
 from physical_configuration import ChannelPhysicalConfiguration
+from quality_policy import quality_summary, science_view
 
 
 class DashboardStore:
@@ -173,12 +174,25 @@ class DashboardStore:
                         **flag.model_dump(mode="json"),
                     }
                 )
+        summary = {"implausible": 0, "suspicious": 0, "unusual": 0}
+        for record in records:
+            record_summary = quality_summary(record)
+            for key in summary:
+                summary[key] += int(record_summary[key])
         return {
             "device_id": device_id,
             "measurement_count": len(records),
             "flag_count": len(flags),
+            "quality_summary": summary,
+            "raw_records_retained": True,
             "flags": flags,
         }
+
+    def list_science_measurements(
+        self, device_id: str, channel_id: str | None = None, limit: int = 1000
+    ) -> list[MeasurementRecord]:
+        """Return a derived science view; stored raw records are untouched."""
+        return science_view(self.list_measurements(device_id, channel_id, limit))
 
     def save_configuration(
         self,
