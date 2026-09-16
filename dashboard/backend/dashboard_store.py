@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from measurement_contract import MeasurementRecord
+from physical_configuration import ChannelPhysicalConfiguration
 
 
 class DashboardStore:
@@ -41,10 +42,76 @@ class DashboardStore:
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (device_id, config_version)
             );
+            CREATE TABLE IF NOT EXISTS channel_physical_configurations (
+                device_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                config_version TEXT NOT NULL,
+                configuration_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (device_id, channel_id, config_version)
+            );
             """
         )
         connection.commit()
         connection.close()
+
+    def save_channel_configuration(
+        self, configuration: ChannelPhysicalConfiguration
+    ) -> None:
+        connection = sqlite3.connect(self.database_path)
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO channel_physical_configurations (
+                device_id, channel_id, config_version, configuration_json, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                configuration.device_id,
+                configuration.channel_id,
+                configuration.config_version,
+                json.dumps(configuration.as_edge_payload(), separators=(",", ":")),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        connection.commit()
+        connection.close()
+
+    def get_channel_configuration(
+        self, device_id: str, channel_id: str, config_version: str | None = None
+    ) -> ChannelPhysicalConfiguration | None:
+        connection = sqlite3.connect(self.database_path)
+        query = """
+            SELECT configuration_json FROM channel_physical_configurations
+            WHERE device_id = ? AND channel_id = ?
+        """
+        params: list[Any] = [device_id, channel_id]
+        if config_version is not None:
+            query += " AND config_version = ?"
+            params.append(config_version)
+        else:
+            query += " ORDER BY created_at DESC LIMIT 1"
+        row = connection.execute(query, params).fetchone()
+        connection.close()
+        if row is None:
+            return None
+        return ChannelPhysicalConfiguration.model_validate(json.loads(row[0]))
+
+    def list_channel_configurations(
+        self, device_id: str
+    ) -> list[ChannelPhysicalConfiguration]:
+        connection = sqlite3.connect(self.database_path)
+        rows = connection.execute(
+            """
+            SELECT configuration_json FROM channel_physical_configurations
+            WHERE device_id = ? ORDER BY channel_id, created_at DESC
+            """,
+            (device_id,),
+        ).fetchall()
+        connection.close()
+        return [
+            ChannelPhysicalConfiguration.model_validate(json.loads(row[0]))
+            for row in rows
+        ]
 
     def ingest(self, record: MeasurementRecord, run_id: str | None = None) -> bool:
         """Store a validated record without changing its raw payload."""

@@ -69,3 +69,9 @@ The edge processor reads these optional `raw_register_data` fields when the corr
 MAX31855 reserved bits are checked using the documented reserved-bit mask, and the processor records that this interface has no CRC or parity. DS18B20 scratchpad CRC-8 is calculated locally. A configured `rom_manifests` map on `EdgeProcessor` verifies the complete bus topology at the configured periodic interval. None of these checks alter `raw_value`.
 
 Timing fields are carried in `MeasurementRecord.timing`: monotonic conversion start/completion, declared conversion delay, conversion completion status, and explicit cross-sensor offset. `interval_statistics` carries count, mean, minimum, maximum, and standard deviation for raw oversamples; the individual raw samples remain the source data and are never replaced by the summary.
+
+## Per-channel physical configuration
+
+`physical_configuration.py` defines the channel configuration published to an edge node. It includes sensor and front-end identity, junction style, probe geometry and installation, measured thermal time constant and uncertainty, physical bounds, source/sink limits, noise floor, acquisition interval, datasheet resolution, thermocouple tolerance class, board/node identity, and related fast/slow sensor pairs.
+
+The model accepts only measured-$\\tau$ provenance (`commissioning_step`, `online_transient_fit`, or both). A catalogue default is intentionally invalid. Publish it through `PUT /api/devices/<device_id>/channels/<channel_id>/physical-config`; retrieve the active version with the corresponding `GET` endpoint.

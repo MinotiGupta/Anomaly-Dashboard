@@ -27,6 +27,7 @@ from scipy.signal import argrelextrema
 import traceback
 from dashboard_store import DashboardStore
 from measurement_contract import MeasurementRecord
+from physical_configuration import ChannelPhysicalConfiguration
 
 
 # ====================================================================
@@ -1142,6 +1143,39 @@ def save_edge_configuration(device_id):
     return jsonify(dashboard_store.get_configuration(
         device_id, payload["config_version"]
     )), 201
+
+
+@app.route("/api/devices/<device_id>/channels/<channel_id>/physical-config", methods=["PUT"])
+def save_channel_physical_configuration(device_id, channel_id):
+    """Validate and publish one channel's measured physical configuration."""
+    payload = request.get_json(silent=True) or {}
+    payload["device_id"] = device_id
+    payload["channel_id"] = channel_id
+    try:
+        configuration = ChannelPhysicalConfiguration.model_validate(payload)
+        dashboard_store.save_channel_configuration(configuration)
+        return jsonify(configuration.as_edge_payload()), 201
+    except Exception as exc:
+        return jsonify({"error": f"Invalid channel configuration: {exc}"}), 400
+
+
+@app.route("/api/devices/<device_id>/channels/<channel_id>/physical-config", methods=["GET"])
+def get_channel_physical_configuration(device_id, channel_id):
+    configuration = dashboard_store.get_channel_configuration(
+        device_id, channel_id, request.args.get("config_version")
+    )
+    if configuration is None:
+        return jsonify({"error": "Channel configuration not found"}), 404
+    return jsonify(configuration.as_edge_payload())
+
+
+@app.route("/api/devices/<device_id>/physical-config", methods=["GET"])
+def list_device_physical_configurations(device_id):
+    configurations = dashboard_store.list_channel_configurations(device_id)
+    return jsonify({
+        "device_id": device_id,
+        "channels": [configuration.as_edge_payload() for configuration in configurations],
+    })
 
 
 # ====================================================================
