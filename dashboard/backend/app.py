@@ -533,13 +533,47 @@ def load_and_summarize_data(file_path):
     # Exclude Timestamp if it crept in
     sensor_cols = [c for c in sensor_cols if c != "Timestamp"]
 
-    # Scrub hardware overloads
+    # Preserve sensor cells exactly as loaded. Numeric parsing below is only
+    # used to add quality annotations; it never replaces the source values.
+    quality_flags = []
     for col in sensor_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-        overload_mask = (df[col].abs() > 10000) | (df[col] == np.inf)
-        df.loc[overload_mask, col] = np.nan
-
-    df[sensor_cols] = df[sensor_cols].ffill().bfill()
+        parsed = pd.to_numeric(df[col], errors="coerce")
+        missing_mask = df[col].isna()
+        invalid_mask = parsed.isna() & df[col].notna()
+        non_finite_mask = parsed.notna() & ~np.isfinite(parsed)
+        overload_mask = parsed.abs() > 10000
+        for row_index in df.index[missing_mask]:
+            quality_flags.append({
+                "row_index": int(row_index) if isinstance(row_index, (int, np.integer)) else str(row_index),
+                "channel_id": str(col),
+                "code": "missing_sensor_value",
+                "classification": "suspicious",
+                "raw_value": None,
+            })
+        for row_index in df.index[invalid_mask]:
+            quality_flags.append({
+                "row_index": int(row_index) if isinstance(row_index, (int, np.integer)) else str(row_index),
+                "channel_id": str(col),
+                "code": "non_numeric_sensor_value",
+                "classification": "implausible",
+                "raw_value": str(df.at[row_index, col]),
+            })
+        for row_index in df.index[non_finite_mask]:
+            quality_flags.append({
+                "row_index": int(row_index) if isinstance(row_index, (int, np.integer)) else str(row_index),
+                "channel_id": str(col),
+                "code": "non_finite_sensor_value",
+                "classification": "implausible",
+                "raw_value": str(df.at[row_index, col]),
+            })
+        for row_index in df.index[overload_mask]:
+            quality_flags.append({
+                "row_index": int(row_index) if isinstance(row_index, (int, np.integer)) else str(row_index),
+                "channel_id": str(col),
+                "code": "sensor_overload",
+                "classification": "implausible",
+                "raw_value": str(df.at[row_index, col]),
+            })
 
     # Calculate average interval
     try:
@@ -555,6 +589,7 @@ def load_and_summarize_data(file_path):
         "total_channels": len(sensor_cols),
         "sensor_columns": sensor_cols,
         "avg_interval": avg_interval,
+        "quality_flags": quality_flags,
     }
 
     return df, sensor_cols, summary
