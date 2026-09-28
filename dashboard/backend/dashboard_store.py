@@ -280,30 +280,40 @@ class DashboardStore:
         }
 
     def fit_channel_parameters(self, device_id: str) -> list[dict[str, Any]]:
-        """Fit transparent noise and first-order time-constant estimates."""
+        """Fit parameters from science-eligible samples and report exclusions."""
         records = self.list_measurements(device_id)
-        by_channel: dict[str, list[MeasurementRecord]] = {}
+        raw_by_channel: dict[str, list[MeasurementRecord]] = {}
         for record in records:
-            by_channel.setdefault(record.channel_id, []).append(record)
+            raw_by_channel.setdefault(record.channel_id, []).append(record)
+        science_by_channel: dict[str, list[MeasurementRecord]] = {}
+        for record in science_view(records):
+            science_by_channel.setdefault(record.channel_id, []).append(record)
 
         fitted = []
-        for channel_id, channel_records in by_channel.items():
+        for channel_id, raw_channel_records in raw_by_channel.items():
+            channel_records = science_by_channel.get(channel_id, [])
             values = [float(record.raw_value) for record in channel_records]
             intervals = [record.sample_interval_seconds for record in channel_records]
-            mean_value = sum(values) / len(values)
+            mean_value = sum(values) / len(values) if values else None
             differences = [b - a for a, b in zip(values, values[1:])]
             noise_floor = (
                 math.sqrt(sum((value - mean_value) ** 2 for value in differences) / len(differences))
                 / math.sqrt(2)
                 if differences
-                else 0.0
+                else None
             )
-            tau_seconds = self._estimate_tau(values, sum(intervals) / len(intervals))
+            tau_seconds = (
+                self._estimate_tau(values, sum(intervals) / len(intervals))
+                if values
+                else None
+            )
             fitted.append(
                 {
                     "device_id": device_id,
                     "channel_id": channel_id,
                     "sample_count": len(values),
+                    "raw_record_count": len(raw_channel_records),
+                    "excluded_implausible_count": len(raw_channel_records) - len(values),
                     "mean_value": mean_value,
                     "noise_floor": noise_floor,
                     "estimated_tau_seconds": tau_seconds,

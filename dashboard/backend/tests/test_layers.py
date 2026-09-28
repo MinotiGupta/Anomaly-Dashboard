@@ -71,7 +71,12 @@ def test_dashboard_stores_raw_records_and_versioned_config(tmp_path):
     stored = store.list_measurements("node-1")
     assert [record.raw_value for record in stored] == [20.0, 21.0, 20.5]
     assert store.diagnostics("node-1")["flag_count"] == 3
-    assert store.fit_channel_parameters("node-1")[0]["sample_count"] == 3
+    fit = store.fit_channel_parameters("node-1")[0]
+    assert fit["sample_count"] == 0
+    assert fit["raw_record_count"] == 3
+    assert fit["excluded_implausible_count"] == 3
+    assert fit["mean_value"] is None
+    assert fit["estimated_tau_seconds"] is None
 
     store.save_configuration(
         "node-1",

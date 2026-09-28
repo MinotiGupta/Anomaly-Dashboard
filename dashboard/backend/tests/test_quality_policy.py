@@ -100,3 +100,9 @@ def test_dashboard_keeps_raw_and_exposes_quality_summary(tmp_path):
         "suspicious": 1,
         "unusual": 0,
     }
+
+    fit = store.fit_channel_parameters("node-1")[0]
+    assert fit["sample_count"] == 1
+    assert fit["raw_record_count"] == 2
+    assert fit["excluded_implausible_count"] == 1
+    assert fit["mean_value"] == 20.0
