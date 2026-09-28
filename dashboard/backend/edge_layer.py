@@ -108,9 +108,22 @@ class EdgeProcessor:
             for device_id, rom_ids in (rom_manifests or {}).items()
         }
         self.rom_manifest_check_interval = max(1, rom_manifest_check_interval)
-        self.physical_configurations = physical_configurations or {}
+        self.physical_configurations: dict[str, ChannelPhysicalConfiguration] = {}
+        self.set_physical_configurations(physical_configurations or {})
         self.physics_detector = PhysicsDetector()
         self.thermal_bias_analyzer = ThermalBiasAnalyzer()
+
+    def set_physical_configurations(
+        self, configurations: dict[str, ChannelPhysicalConfiguration]
+    ) -> None:
+        """Install channel configuration snapshots for offline edge processing."""
+        for channel_id, configuration in configurations.items():
+            if channel_id != configuration.channel_id:
+                raise ValueError(
+                    f"Configuration key {channel_id!r} does not match its channel ID "
+                    f"{configuration.channel_id!r}"
+                )
+        self.physical_configurations = dict(configurations)
 
     def process(self, record: MeasurementRecord) -> MeasurementRecord:
         state = self.state_store.load(record.device_id, record.channel_id)

@@ -5,6 +5,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import app as backend_app
 from dashboard_store import DashboardStore
+from edge_layer import EdgeStateStore
 
 
 def test_physical_configuration_routes_validate_and_publish(tmp_path):
@@ -48,3 +49,12 @@ def test_physical_configuration_routes_validate_and_publish(tmp_path):
     response = client.get("/api/devices/node-api/physical-config")
     assert response.status_code == 200
     assert len(response.json["channels"]) == 1
+
+    state_store = EdgeStateStore(tmp_path / "edge.db")
+    processor = backend_app.create_edge_processor(state_store, "node-api")
+    assert set(processor.physical_configurations) == {"channel-api"}
+    assert (
+        processor.physical_configurations["channel-api"].thermal_time_constant_seconds
+        == 10.0
+    )
+    state_store.close()

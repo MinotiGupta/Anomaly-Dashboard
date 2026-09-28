@@ -103,8 +103,18 @@ class DashboardStore:
         connection = sqlite3.connect(self.database_path)
         rows = connection.execute(
             """
-            SELECT configuration_json FROM channel_physical_configurations
-            WHERE device_id = ? ORDER BY channel_id, created_at DESC
+            SELECT current.configuration_json
+            FROM channel_physical_configurations AS current
+            WHERE current.device_id = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM channel_physical_configurations AS newer
+                  WHERE newer.device_id = current.device_id
+                    AND newer.channel_id = current.channel_id
+                    AND (newer.created_at > current.created_at
+                         OR (newer.created_at = current.created_at
+                             AND newer.rowid > current.rowid))
+              )
+            ORDER BY current.channel_id
             """,
             (device_id,),
         ).fetchall()

@@ -26,6 +26,7 @@ from scipy.stats import gaussian_kde
 from scipy.signal import argrelextrema
 import traceback
 from dashboard_store import DashboardStore
+from edge_layer import EdgeProcessor, EdgeStateStore
 from measurement_contract import MeasurementRecord
 from physical_configuration import ChannelPhysicalConfiguration
 
@@ -84,6 +85,29 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(FEEDBACK_DIR, exist_ok=True)
 os.makedirs(MODELS_DIR, exist_ok=True)
 dashboard_store = DashboardStore(DASHBOARD_DB)
+
+
+def create_edge_processor(
+    state_store: EdgeStateStore,
+    device_id: str,
+    *,
+    ruleset_version: str = "edge-1",
+) -> EdgeProcessor:
+    """Create an edge processor with the device's published config snapshot.
+
+    The returned processor keeps that snapshot in memory, so acquisition can
+    continue offline after initialization. Recreate it or call
+    ``set_physical_configurations`` after publishing configuration updates.
+    """
+    configurations = {
+        config.channel_id: config
+        for config in dashboard_store.list_channel_configurations(device_id)
+    }
+    return EdgeProcessor(
+        state_store,
+        ruleset_version=ruleset_version,
+        physical_configurations=configurations,
+    )
 
 # Store run results in memory (keyed by run_id)
 results_store = {}
