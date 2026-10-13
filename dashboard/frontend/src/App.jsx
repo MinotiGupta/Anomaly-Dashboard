@@ -1,7 +1,8 @@
 import { useState } from 'react';
-import { uploadCSV, runModel } from './api';
+import { uploadCSV, runModel, runPhysicsModel } from './api';
 import UploadZone from './components/UploadZone';
 import ResultsDashboard from './components/ResultsDashboard';
+import PhysicsResults from './components/PhysicsResults';
 
 function App() {
   const [uploadedFile, setUploadedFile] = useState(null);
@@ -11,6 +12,7 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [useFeedback, setUseFeedback] = useState(false);
+  const [modelType, setModelType] = useState('lstm');
 
   const handleFileSelect = async (file) => {
     setError(null);
@@ -30,7 +32,9 @@ function App() {
     setError(null);
     setLoading(true);
     try {
-      const data = await runModel(filePath, useFeedback);
+      const data = modelType === 'physics'
+        ? await runPhysicsModel(filePath)
+        : await runModel(filePath, useFeedback);
       setResults(data.results);
       setRunId(data.run_id);
     } catch (err) {
@@ -64,6 +68,7 @@ function App() {
     setError(null);
     setLoading(false);
     setUseFeedback(false);
+    setModelType('lstm');
   };
 
   const dataTypeLabel = (dt) => {
@@ -83,7 +88,7 @@ function App() {
         <div className="app-header__title-group">
           <h1 className="app-header__title">Anomaly Detection</h1>
           <p className="app-header__subtitle">
-            LSTM Autoencoder Pipeline
+            {modelType === 'physics' ? 'Physics Plausibility Model' : 'LSTM Autoencoder Pipeline'}
             {results && results.data_type && (
               <span style={{ marginLeft: 12, color: 'var(--accent-blue)' }}>
                 / {dataTypeLabel(results.data_type)}
@@ -92,7 +97,14 @@ function App() {
           </p>
         </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+          <label style={{ color: 'var(--text-secondary)', fontSize: '0.82rem' }}>
+            Model{' '}
+            <select value={modelType} onChange={(e) => { setModelType(e.target.value); setResults(null); }} disabled={loading || Boolean(results)} style={{ padding: '7px 10px', borderRadius: 6, marginLeft: 4 }}>
+              <option value="lstm">LSTM Autoencoder</option>
+              <option value="physics">Physics Plausibility (K-type probe)</option>
+            </select>
+          </label>
           {uploadedFile && (
             <div className="file-chip">
               <span>{uploadedFile.name}</span>
@@ -104,7 +116,7 @@ function App() {
 
           {uploadedFile && !results && !loading && (
             <>
-              <label
+              {modelType === 'lstm' && <label
                 style={{
                   display: 'flex',
                   alignItems: 'center',
@@ -121,7 +133,7 @@ function App() {
                   style={{ accentColor: 'var(--accent-blue)' }}
                 />
                 Use past feedback
-              </label>
+              </label>}
               <button className="btn btn--primary" onClick={handleRun}>
                 Run Model
               </button>
@@ -159,7 +171,7 @@ function App() {
         <div className="progress-overlay">
           <div className="spinner" />
           <p className="progress-overlay__text">
-            Training LSTM Autoencoder and detecting anomalies...
+            {modelType === 'physics' ? 'Applying deterministic physics checks...' : 'Training LSTM Autoencoder and detecting anomalies...'}
           </p>
           <p className="progress-overlay__subtext">
             This runs the actual model — it may take a moment depending on data size.
@@ -167,7 +179,8 @@ function App() {
         </div>
       )}
 
-      {results && (
+      {results && results.model === 'physics' && <PhysicsResults data={results} />}
+      {results && results.model !== 'physics' && (
         <ResultsDashboard
           data={results}
           runId={runId}

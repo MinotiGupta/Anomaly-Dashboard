@@ -32,6 +32,19 @@ export async function runModel(filePath, useFeedback = false) {
   return res.json();
 }
 
+export async function runPhysicsModel(filePath) {
+  const res = await fetch(`${API_BASE}/run-physics`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: filePath }),
+  });
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.error || 'Physics analysis failed');
+  }
+  return res.json();
+}
+
 export async function submitFeedback(runId, dataType, fileName, feedbackEntries) {
   const res = await fetch(`${API_BASE}/feedback`, {
     method: 'POST',

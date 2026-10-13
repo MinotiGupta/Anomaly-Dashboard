@@ -1041,6 +1041,79 @@ def run_model():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/run-physics", methods=["POST"])
+def run_physics_model():
+    """Run the notebook's deterministic K-type probe plausibility checks."""
+    data = request.get_json() or {}
+    file_path = data.get("path")
+    if not file_path or not os.path.isfile(file_path):
+        return jsonify({"error": "File not found"}), 400
+    try:
+        # Match the notebook's instrument export header detection.
+        header_idx = 0
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as source:
+            for idx, line in enumerate(source):
+                if any(marker in line for marker in ("Scan Swee", "Scan Number", "101Time")):
+                    header_idx = idx
+                    break
+        frame = pd.read_csv(file_path, skiprows=header_idx).dropna(how="all", axis=1)
+        if frame.empty or len(frame.columns) < 2:
+            return jsonify({"error": "CSV must contain a time column and a temperature column"}), 400
+        time_cols = [col for col in frame.columns if "time" in str(col).lower()]
+        time_col = time_cols[0] if time_cols else frame.columns[0]
+        sensor_cols = [col for col in frame.columns if "°c" in str(col).lower() or "101" in str(col)]
+        sensor_col = sensor_cols[-1] if sensor_cols else frame.columns[-1]
+        frame[sensor_col] = pd.to_numeric(frame[sensor_col], errors="coerce")
+        time_values = frame[time_col].dropna()
+        if time_values.empty:
+            return jsonify({"error": "No usable timestamps found"}), 400
+        first_time = str(time_values.iloc[0])
+        if " " in first_time or "-" in first_time:
+            frame["Timestamp"] = pd.to_datetime(frame[time_col], errors="coerce")
+            frame = frame.dropna(subset=["Timestamp", sensor_col]).copy()
+            frame["Seconds_Elapsed"] = (frame["Timestamp"] - frame["Timestamp"].iloc[0]).dt.total_seconds()
+        else:
+            frame["Timestamp"] = pd.to_timedelta("00:" + frame[time_col].astype(str), errors="coerce")
+            frame = frame.dropna(subset=["Timestamp", sensor_col]).copy()
+            frame["Seconds_Elapsed"] = frame["Timestamp"].dt.total_seconds()
+        if frame.empty:
+            return jsonify({"error": "No rows have both a valid timestamp and numeric temperature"}), 400
+
+        # TemperatureChannel.process semantics and shared_config from new_15_phy_mod_applied.ipynb.
+        tau, margin, sink, drive_max, sensor_min, sensor_max = 15.0, 1.2, 20.0, 2200.0, -50.0, 1370.0
+        previous_time = previous_temp = None
+        points = []
+        for _, row in frame.iterrows():
+            timestamp = row["Timestamp"]
+            t_now, temp = float(row["Seconds_Elapsed"]), float(row[sensor_col])
+            reasons = []
+            if temp < sensor_min or temp > sensor_max:
+                reasons.append("Hard sensor limit violated")
+            if temp < sink or temp > drive_max:
+                reasons.append("Thermodynamic bound violated")
+            dt = t_now - previous_time if previous_time is not None else None
+            if previous_temp is not None and dt is not None and dt > 0:
+                slope = (temp - previous_temp) / dt
+                max_slope = (drive_max - previous_temp) / tau
+                min_slope = -(previous_temp - sink) / tau
+                if slope > max_slope * margin or slope < min_slope * margin:
+                    reasons.append(f"Rate of change ({slope:.2f} K/s) exceeds limit")
+            valid = not reasons
+            points.append({"timestamp": timestamp.isoformat(), "temperature": temp,
+                           "quality": "VALID" if valid else "IMPLAUSIBLE", "reason": " | ".join(reasons)})
+            if valid:
+                previous_time, previous_temp = t_now, temp
+        anomalies = [point for point in points if point["quality"] == "IMPLAUSIBLE"]
+        return jsonify({"results": {"model": "physics", "file_name": os.path.basename(file_path),
+            "channel": str(sensor_col), "total_points": len(points), "total_anomalies": len(anomalies),
+            "anomaly_rate": round(len(anomalies) / len(points) * 100, 2), "points": points,
+            "config": {"tau_seconds": tau, "tau_uncertainty_margin": margin, "sink_c": sink,
+                       "drive_max_c": drive_max, "sensor_min_c": sensor_min, "sensor_max_c": sensor_max}}})
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({"error": f"Could not process CSV: {exc}"}), 400
+
+
 @app.route("/api/feedback", methods=["POST"])
 def submit_feedback():
     """Save user feedback on detected anomalies."""
