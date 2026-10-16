@@ -29,7 +29,13 @@ from dashboard_store import DashboardStore
 from edge_layer import EdgeProcessor, EdgeStateStore
 from measurement_contract import MeasurementRecord
 from physical_configuration import ChannelPhysicalConfiguration
-from hybrid_mlops import get_tracked_run, get_tracked_runs, train_and_register
+from hybrid_mlops import (
+    fit_feedback_classifier,
+    get_tracked_run,
+    get_tracked_runs,
+    train_and_register,
+    update_tracked_run,
+)
 
 
 # ====================================================================
@@ -116,7 +122,8 @@ def create_edge_processor(
 results_store = {}
 
 # Known data types (matching folder names in C:\dev\AnomalyDetection\data)
-KNOWN_DATA_TYPES = ["biomass", "cataluminescence", "swiss_roll", "default"]
+PHYSICS_FEEDBACK_DATA_TYPE = "physics_isolation_forest"
+KNOWN_DATA_TYPES = ["biomass", "cataluminescence", "swiss_roll", "default", PHYSICS_FEEDBACK_DATA_TYPE]
 
 
 # ====================================================================
@@ -1049,6 +1056,7 @@ def run_physics_model():
     """Run the notebook's physics veto plus Isolation Forest anomaly model."""
     data = request.get_json() or {}
     file_path = data.get("path")
+    use_feedback = bool(data.get("use_feedback", False))
     if not file_path or not os.path.isfile(file_path):
         return jsonify({"error": "File not found"}), 400
     try:
@@ -1133,21 +1141,103 @@ def run_physics_model():
             tracking_database=MLOPS_TRACKING_DB,
             physics_veto_count=sum(point["physics_flag"] == "IMPLAUSIBLE" for point in points),
         )
-        for point, is_outlier, score in zip(points, ml_outlier_mask, ml_scores):
+        for point, is_outlier, score, rate in zip(points, ml_outlier_mask, ml_scores, rates):
             point["ml_outlier"] = int(is_outlier)
             point["isolation_forest_score"] = float(score)
+            point["dT_dt_raw"] = float(rate)
             if point["physics_flag"] == "VALID" and is_outlier:
                 point["quality"] = "STATISTICAL_OUTLIER"
                 point["reason"] = "Isolation Forest statistical outlier"
 
+        model_total_anomalies = sum(point["quality"] != "VALID" for point in points)
+        existing_feedback = {}
+        feedback_entries = get_feedback_for_type(PHYSICS_FEEDBACK_DATA_TYPE)
+        for feedback_entry in feedback_entries:
+            sensor_values = feedback_entry.get("sensor_values") or {}
+            if isinstance(sensor_values, str):
+                try:
+                    sensor_values = json.loads(sensor_values)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+            if sensor_values.get("dataset_sha256") == mlops_metadata["source_sha256"]:
+                existing_feedback.setdefault(
+                    feedback_entry["timestamp"], int(feedback_entry["is_true_anomaly"])
+                )
+
+        feedback_model_predictions = feedback_model_confidence = None
+        feedback_model_metadata = {
+            "enabled": False,
+            "reason": "Use past feedback is off" if not use_feedback else "No eligible prior labels",
+            "training_examples": 0,
+        }
+        if use_feedback:
+            feedback_features = np.column_stack((temperatures, rates))
+            feedback_model_predictions, feedback_model_confidence, feedback_model_metadata = fit_feedback_classifier(
+                feedback_entries=feedback_entries,
+                features=feedback_features,
+                current_dataset_sha256=mlops_metadata["source_sha256"],
+                artifact_path=os.path.join(os.path.dirname(mlops_metadata["artifact_path"]), "feedback_classifier.joblib"),
+            )
+
+        feedback_applied_count = feedback_adjusted_count = 0
+        for index, point in enumerate(points):
+            model_quality = point["quality"]
+            point["model_quality"] = model_quality
+            point["feedback_label"] = existing_feedback.get(point["timestamp"])
+            point["feedback_applied"] = False
+            point["feedback_source"] = None
+            point["final_anomaly"] = model_quality != "VALID"
+            if not use_feedback:
+                continue
+
+            feedback_label = existing_feedback.get(point["timestamp"])
+            feedback_source = "same_dataset_review" if feedback_label is not None else None
+            if feedback_label is None and feedback_model_predictions is not None and point["physics_flag"] == "VALID":
+                confidence = max(
+                    float(feedback_model_confidence[index]),
+                    1.0 - float(feedback_model_confidence[index]),
+                )
+                if confidence >= feedback_model_metadata["confidence_threshold"]:
+                    feedback_label = int(feedback_model_predictions[index])
+                    feedback_source = "learned_human_feedback"
+            if feedback_label is None:
+                continue
+
+            point["feedback_applied"] = True
+            point["feedback_source"] = feedback_source
+            point["final_anomaly"] = bool(feedback_label)
+            feedback_applied_count += 1
+            if bool(feedback_label) != (model_quality != "VALID"):
+                feedback_adjusted_count += 1
+            if feedback_label:
+                if point["physics_flag"] == "VALID":
+                    point["quality"] = "STATISTICAL_OUTLIER"
+                point["reason"] = "Confirmed by saved human feedback"
+            else:
+                point["quality"] = "VALID"
+                point["reason"] = "Marked as a false positive by saved human feedback"
+
+        mlops_metadata["feedback"] = {
+            "enabled_for_run": use_feedback,
+            "same_dataset_labels": len(existing_feedback),
+            "applied_to_points": feedback_applied_count,
+            "changed_model_decisions": feedback_adjusted_count,
+            "classifier": feedback_model_metadata,
+        }
+        update_tracked_run(MLOPS_TRACKING_DB, mlops_metadata)
+
         physics_anomalies = [point for point in points if point["physics_flag"] == "IMPLAUSIBLE"]
         ml_anomalies = [point for point in points if point["physics_flag"] == "VALID" and point["ml_outlier"]]
-        anomalies = physics_anomalies + ml_anomalies
+        anomalies = [point for point in points if point["final_anomaly"]]
         results = {"model": "physics", "file_name": os.path.basename(file_path),
             "run_id": run_id,
             "model_name": "Physics Constrained with Isolation Forest",
             "channel": str(sensor_col), "total_points": len(points), "total_anomalies": len(anomalies),
             "physics_anomalies": len(physics_anomalies), "isolation_forest_anomalies": len(ml_anomalies),
+            "model_total_anomalies": model_total_anomalies,
+            "feedback_data_type": PHYSICS_FEEDBACK_DATA_TYPE,
+            "existing_feedback": {key: bool(value) for key, value in existing_feedback.items()},
+            "used_feedback": use_feedback,
             "anomaly_rate": round(len(anomalies) / len(points) * 100, 2), "points": points,
             "mlops": mlops_metadata,
             "config": {"tau_seconds": tau, "tau_uncertainty_margin": margin, "sink_c": sink,

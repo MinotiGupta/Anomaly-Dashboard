@@ -33,7 +33,7 @@ function App() {
     setLoading(true);
     try {
       const data = modelType === 'physics'
-        ? await runPhysicsModel(filePath)
+        ? await runPhysicsModel(filePath, useFeedback)
         : await runModel(filePath, useFeedback);
       setResults(data.results);
       setRunId(data.run_id);
@@ -49,8 +49,11 @@ function App() {
     setError(null);
     setLoading(true);
     setResults(null);
+    setUseFeedback(true);
     try {
-      const data = await runModel(filePath, true);
+      const data = modelType === 'physics'
+        ? await runPhysicsModel(filePath, true)
+        : await runModel(filePath, true);
       setResults(data.results);
       setRunId(data.run_id);
     } catch (err) {
@@ -116,7 +119,7 @@ function App() {
 
           {uploadedFile && !results && !loading && (
             <>
-              {modelType === 'lstm' && <label
+              <label
                 style={{
                   display: 'flex',
                   alignItems: 'center',
@@ -133,7 +136,7 @@ function App() {
                   style={{ accentColor: 'var(--accent-blue)' }}
                 />
                 Use past feedback
-              </label>}
+              </label>
               <button className="btn btn--primary" onClick={handleRun}>
                 Run Model
               </button>
@@ -179,7 +182,9 @@ function App() {
         </div>
       )}
 
-      {results && results.model === 'physics' && <PhysicsResults data={results} />}
+      {results && results.model === 'physics' && (
+        <PhysicsResults data={results} runId={runId} onRerun={handleRerun} />
+      )}
       {results && results.model !== 'physics' && (
         <ResultsDashboard
           data={results}

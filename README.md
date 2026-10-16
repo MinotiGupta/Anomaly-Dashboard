@@ -10,6 +10,7 @@ This project provides a robust, interactive dashboard to upload sensor data (CSV
 
 - **MLOps & Model Persistence:** Models and data scalers are saved locally after training. Subsequent runs on the same instrument data type load the saved PyTorch `.pth` weights for instant inference (no redundant training).
 - **Physics + Isolation Forest Run Tracking:** Each hybrid-model upload records a versioned, reproducible training run, data SHA-256, feature schema, parameters, package versions, fit/score timings, anomaly metrics, and a serialized model artifact. Runs are stored in the local model registry and SQLite tracking database.
+- **Hybrid Model Human Feedback:** Review Isolation Forest and physics flags as true anomalies or false positives, save the labels, and apply them on a repeat run. Matching file contents use exact reviewed-point overrides; after at least three examples of each class across two other files, a supervised Random Forest feedback layer can correct predictions on new files.
 - **LSTM Autoencoder Pipeline:** Dynamically scales hidden layers based on the number of input features. Trains on uploaded data to learn normal behavior and flags sequences with high reconstruction error (MAE).
 - **Automatic Data Classification:** Intelligently parses CSV headers to identify the data source (Biomass, Cataluminescence, Swiss Roll, or Default 34970A instruments).
 - **Instrument Metadata Extraction:** Automatically extracts and displays hardware metadata (Model, Serial Number, Firmware, Channel Configurations) from Agilent/Keysight log files.

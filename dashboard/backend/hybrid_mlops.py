@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 import sklearn
 from sklearn.ensemble import IsolationForest
+from sklearn.ensemble import RandomForestClassifier
 
 
 MODEL_NAME = "physics-constrained-isolation-forest"
@@ -105,6 +106,106 @@ def get_tracked_run(database_path: str | Path, run_id: str) -> dict[str, Any] | 
             "SELECT metadata_json FROM mlops_model_runs WHERE run_id = ?", (run_id,)
         ).fetchone()
     return json.loads(row[0]) if row else None
+
+
+def update_tracked_run(database_path: str | Path, metadata: dict[str, Any]) -> None:
+    """Persist post-training metadata such as feedback use and corrections."""
+    _write_json_atomic(Path(metadata["artifact_path"]).parent / "metadata.json", metadata)
+    _record_run(database_path, metadata)
+
+
+def fit_feedback_classifier(
+    *,
+    feedback_entries: list[dict[str, Any]],
+    features: np.ndarray,
+    current_dataset_sha256: str,
+    artifact_path: str | Path,
+) -> tuple[np.ndarray | None, np.ndarray | None, dict[str, Any]]:
+    """Learn a supervised correction layer from prior human labels.
+
+    Exact same-dataset labels are handled as deterministic overrides by the
+    caller. To avoid leakage, this classifier only uses reviewed examples from
+    different file fingerprints and is enabled after both classes have enough
+    examples across multiple files.
+    """
+    examples: list[list[float]] = []
+    labels: list[int] = []
+    source_datasets: set[str] = set()
+    for entry in feedback_entries:
+        sensor_values = entry.get("sensor_values") or {}
+        if isinstance(sensor_values, str):
+            try:
+                sensor_values = json.loads(sensor_values)
+            except (TypeError, json.JSONDecodeError):
+                continue
+        dataset_hash = sensor_values.get("dataset_sha256")
+        if not dataset_hash or dataset_hash == current_dataset_sha256:
+            continue
+        try:
+            temperature = float(sensor_values["temperature"])
+            rate = float(sensor_values["dT_dt_raw"])
+            label = int(entry["is_true_anomaly"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if label not in (0, 1) or not np.isfinite([temperature, rate]).all():
+            continue
+        examples.append([temperature, rate])
+        labels.append(label)
+        source_datasets.add(str(dataset_hash))
+
+    label_counts = {"normal": labels.count(0), "anomaly": labels.count(1)}
+    metadata: dict[str, Any] = {
+        "enabled": False,
+        "training_examples": len(labels),
+        "source_datasets": len(source_datasets),
+        "label_counts": label_counts,
+        "minimum_per_class": 3,
+        "minimum_distinct_files": 2,
+        "parameters": {
+            "n_estimators": 100,
+            "min_samples_leaf": 2,
+            "class_weight": "balanced_subsample",
+            "random_state": 42,
+            "confidence_threshold": 0.8,
+        },
+    }
+    if min(label_counts.values(), default=0) < 3 or len(source_datasets) < 2:
+        metadata["reason"] = "Need at least 3 reviewed examples per class across 2 other files"
+        return None, None, metadata
+
+    feedback_model = RandomForestClassifier(
+        n_estimators=100,
+        min_samples_leaf=2,
+        class_weight="balanced_subsample",
+        random_state=42,
+        n_jobs=1,
+    )
+    feedback_model.fit(np.asarray(examples, dtype=np.float64), np.asarray(labels, dtype=np.int64))
+    probabilities = feedback_model.predict_proba(features)
+    classes = list(feedback_model.classes_)
+    anomaly_column = classes.index(1)
+    anomaly_confidence = probabilities[:, anomaly_column]
+    predicted_labels = (anomaly_confidence >= 0.5).astype(np.int64)
+
+    artifact_path = Path(artifact_path)
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=artifact_path.parent, delete=False, suffix=".tmp") as temp_file:
+        temp_artifact = Path(temp_file.name)
+    try:
+        joblib.dump(feedback_model, temp_artifact)
+        os.replace(temp_artifact, artifact_path)
+    finally:
+        if temp_artifact.exists():
+            temp_artifact.unlink()
+
+    metadata.update({
+        "enabled": True,
+        "reason": "trained_from_prior_human_feedback",
+        "confidence_threshold": 0.8,
+        "artifact_path": str(artifact_path.resolve()),
+        "artifact_sha256": _sha256_file(artifact_path),
+    })
+    return predicted_labels, anomaly_confidence, metadata
 
 
 def train_and_register(
