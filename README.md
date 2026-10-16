@@ -1,10 +1,10 @@
 # Anomaly Detection Dashboard
 
-A full-stack application for real-time anomaly detection in multi-channel sensor data using a Deep Learning (LSTM Autoencoder) pipeline.
+A full-stack application for anomaly detection in sensor data using an LSTM Autoencoder or a Physics Constrained with Isolation Forest pipeline.
 
 ## Overview
 
-This project provides a robust, interactive dashboard to upload sensor data (CSV), automatically classify the instrument type, run a PyTorch-based LSTM Autoencoder to detect anomalies, and visualize the results. It features a Human-in-the-Loop (HITL) feedback system, allowing users to verify anomalies and retrain the model based on their feedback.
+This project provides an interactive dashboard to upload sensor data (CSV), run either the PyTorch-based LSTM Autoencoder or the Physics Constrained with Isolation Forest model, and review the results. Both models support saved human feedback, with a workflow suited to each model.
 
 ## Key Features
 
@@ -14,8 +14,8 @@ This project provides a robust, interactive dashboard to upload sensor data (CSV
 - **LSTM Autoencoder Pipeline:** Dynamically scales hidden layers based on the number of input features. Trains on uploaded data to learn normal behavior and flags sequences with high reconstruction error (MAE).
 - **Automatic Data Classification:** Intelligently parses CSV headers to identify the data source (Biomass, Cataluminescence, Swiss Roll, or Default 34970A instruments).
 - **Instrument Metadata Extraction:** Automatically extracts and displays hardware metadata (Model, Serial Number, Firmware, Channel Configurations) from Agilent/Keysight log files.
-- **Human-in-the-Loop Feedback:** Users can review detected anomalies in a paginated table and mark them as "Yes" (True Anomaly) or "No" (False Positive). Feedback is persisted locally in SQLite databases.
-- **Feedback-Aware Retraining:** The model can be retrained using past user feedback, applying weighted loss to reduce false positives on confirmed normal data points.
+- **LSTM Human Feedback:** Users can mark detected anomalies as "Yes" (true anomaly) or "No" (false positive). Feedback is persisted locally and can be included in LSTM retraining using a weighted loss.
+- **Physics + Isolation Forest Human Feedback:** Users can label flagged readings and save them locally. On a later run, saved labels can override predictions for the same file contents; with enough labels from other files, a supervised Random Forest feedback layer can generalize corrections to new files.
 - **Rich Interactive Visualizations:**
   - Per-channel time-series charts with anomaly overlays.
   - Model diagnostic charts: Training Loss curve and Reconstruction Error (MAE) distribution.
@@ -50,6 +50,11 @@ The core anomaly detection engine relies on a PyTorch-based **LSTM Autoencoder**
   - **Anomaly Scoring:** The Mean Absolute Error (MAE) between the input sequence and the reconstructed sequence serves as the anomaly score. High MAE indicates the model hasn't seen this pattern before, flagging it as an anomaly.
 
 The **Physics Constrained with Isolation Forest** option follows a separate batch pipeline based on `new_15_iso_phy_modelling.ipynb`: it parses and validates the DAQ export, applies the K-type physical veto, engineers temperature and raw `dT/dt` features, fits and scores a deterministic Isolation Forest, validates the outputs, then registers the versioned artifact and run metadata. Because this notebook defines a per-file unsupervised fit and there is no separate labeled training corpus, the model is trained on each uploaded file; fast completion on a few thousand rows is expected. It does not add an artificial delay. Each successful run is visible in the result panel and through `GET /api/mlops/runs` or `GET /api/mlops/runs/<run_id>`.
+
+### Human Feedback Workflows
+
+- **LSTM Autoencoder:** In the Anomaly Log, label flagged readings with **Yes** or **No**, then select **Save Feedback**. Use **Retrain with feedback** to run the LSTM again with saved labels included in its weighted training loss.
+- **Physics Constrained with Isolation Forest:** Label flagged readings with **Yes** or **No** and select **Save Feedback**. Enable **Use past feedback** when running the model again (or select **Re-run with saved feedback** from the results). For identical CSV contents, saved labels are applied to their reviewed readings. For different files, a Random Forest feedback layer is eligible once there are at least three examples of each label across at least two other file contents; it only corrects physics-valid readings when its confidence is at least 80%. This feedback layer supplements the per-file Isolation Forest; it does not retrain the Isolation Forest itself.
 
 ## Architecture
 
@@ -121,12 +126,11 @@ The frontend will run on `http://localhost:5173`.
 
 1. **Open the Dashboard:** Navigate to `http://localhost:5173` in your web browser.
 2. **Upload Data:** Drag and drop or click to upload a supported CSV file.
-3. **Run Analysis:** Click the **"Run Model"** button. The backend will parse the file, train the LSTM model, detect anomalies, and return the results.
+3. **Run Analysis:** Choose a model and click **"Run Model"**. The backend runs the selected model and returns its results.
 4. **Explore Results:**
    - **Overview:** View time-series plots for all channels, training loss, and error distributions.
    - **Sensor Channels:** Drill down into specific channels and view detailed statistics.
    - **Model Diagnostics:** Review the model's configuration and reconstruction error breakdowns.
    - **Anomaly Log:** View the paginated table of all detected anomalies.
    - **Statistics:** Analyze skewness, kurtosis, and confidence intervals across all sensors.
-5. **Provide Feedback:** In the **Anomaly Log** tab, use the **Yes/No** buttons to verify anomalies. Click **"Save Feedback"** to persist your classifications.
-6. **Retrain:** Click **"Retrain with feedback"** to run the model again, incorporating your saved feedback to improve accuracy.
+5. **Provide Feedback:** For the LSTM model, use the **Anomaly Log** tab to label readings and save them; use **"Retrain with feedback"** to include them in LSTM training. For Physics + Isolation Forest, label flagged readings in its results and save them; enable **"Use past feedback"** on the next run or use **"Re-run with saved feedback"** to apply them.
