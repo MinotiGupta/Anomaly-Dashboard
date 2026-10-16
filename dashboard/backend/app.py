@@ -29,6 +29,7 @@ from dashboard_store import DashboardStore
 from edge_layer import EdgeProcessor, EdgeStateStore
 from measurement_contract import MeasurementRecord
 from physical_configuration import ChannelPhysicalConfiguration
+from hybrid_mlops import get_tracked_run, get_tracked_runs, train_and_register
 
 
 # ====================================================================
@@ -80,6 +81,8 @@ CORS(app)
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 FEEDBACK_DIR = os.path.join(os.path.dirname(__file__), "feedback_db")
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
+MLOPS_ARTIFACTS_DIR = os.path.join(MODELS_DIR, "registry")
+MLOPS_TRACKING_DB = os.path.join(os.path.dirname(__file__), "mlops_runs.db")
 DASHBOARD_DB = os.path.join(os.path.dirname(__file__), "dashboard_data.db")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(FEEDBACK_DIR, exist_ok=True)
@@ -1043,20 +1046,25 @@ def run_model():
 
 @app.route("/api/run-physics", methods=["POST"])
 def run_physics_model():
-    """Run the notebook's deterministic K-type probe plausibility checks."""
+    """Run the notebook's physics veto plus Isolation Forest anomaly model."""
     data = request.get_json() or {}
     file_path = data.get("path")
     if not file_path or not os.path.isfile(file_path):
         return jsonify({"error": "File not found"}), 400
     try:
-        # Match the notebook's instrument export header detection.
+        run_id = str(uuid.uuid4())
+        # Match the instrument export parsing used by the notebooks.
         header_idx = 0
         with open(file_path, "r", encoding="utf-8", errors="ignore") as source:
             for idx, line in enumerate(source):
-                if any(marker in line for marker in ("Scan Swee", "Scan Number", "101Time")):
+                # Avoid metadata rows such as "Start Time" and channel configuration
+                # rows: the data header in DAQ970A exports starts with these markers.
+                if any(marker in line for marker in ("Scan Sweep Time", "Scan Swee", "Scan Number", "101Time")):
                     header_idx = idx
                     break
-        frame = pd.read_csv(file_path, skiprows=header_idx).dropna(how="all", axis=1)
+        frame = pd.read_csv(file_path, skiprows=header_idx)
+        frame.columns = frame.columns.astype(str).str.strip()
+        frame = frame.dropna(how="all", axis=1).dropna(how="all", axis=0)
         if frame.empty or len(frame.columns) < 2:
             return jsonify({"error": "CSV must contain a time column and a temperature column"}), 400
         time_cols = [col for col in frame.columns if "time" in str(col).lower()]
@@ -1069,17 +1077,21 @@ def run_physics_model():
             return jsonify({"error": "No usable timestamps found"}), 400
         first_time = str(time_values.iloc[0])
         if " " in first_time or "-" in first_time:
-            frame["Timestamp"] = pd.to_datetime(frame[time_col], errors="coerce")
+            frame["Timestamp"] = pd.to_datetime(frame[time_col], format="mixed", errors="coerce")
             frame = frame.dropna(subset=["Timestamp", sensor_col]).copy()
+            if frame.empty:
+                return jsonify({"error": f"No usable timestamps found in column '{time_col}'"}), 400
             frame["Seconds_Elapsed"] = (frame["Timestamp"] - frame["Timestamp"].iloc[0]).dt.total_seconds()
         else:
             frame["Timestamp"] = pd.to_timedelta("00:" + frame[time_col].astype(str), errors="coerce")
             frame = frame.dropna(subset=["Timestamp", sensor_col]).copy()
+            if frame.empty:
+                return jsonify({"error": f"No usable timestamps found in column '{time_col}'"}), 400
             frame["Seconds_Elapsed"] = frame["Timestamp"].dt.total_seconds()
         if frame.empty:
             return jsonify({"error": "No rows have both a valid timestamp and numeric temperature"}), 400
 
-        # TemperatureChannel.process semantics and shared_config from new_15_phy_mod_applied.ipynb.
+        # TemperatureChannel.process semantics and shared_config from the physics notebooks.
         tau, margin, sink, drive_max, sensor_min, sensor_max = 15.0, 1.2, 20.0, 2200.0, -50.0, 1370.0
         previous_time = previous_temp = None
         points = []
@@ -1097,21 +1109,77 @@ def run_physics_model():
                 max_slope = (drive_max - previous_temp) / tau
                 min_slope = -(previous_temp - sink) / tau
                 if slope > max_slope * margin or slope < min_slope * margin:
-                    reasons.append(f"Rate of change ({slope:.2f} K/s) exceeds limit")
+                    reasons.append(f"Physics Rate Violation ({slope:.2f} K/s)")
             valid = not reasons
             points.append({"timestamp": timestamp.isoformat(), "temperature": temp,
-                           "quality": "VALID" if valid else "IMPLAUSIBLE", "reason": " | ".join(reasons)})
+                           "quality": "VALID" if valid else "IMPLAUSIBLE", "reason": " | ".join(reasons),
+                           "physics_flag": "VALID" if valid else "IMPLAUSIBLE"})
             if valid:
                 previous_time, previous_temp = t_now, temp
-        anomalies = [point for point in points if point["quality"] == "IMPLAUSIBLE"]
-        return jsonify({"results": {"model": "physics", "file_name": os.path.basename(file_path),
+
+        # Match new_15_iso_phy_modelling.ipynb: fit per file on temperature
+        # and first-difference dT/dt; only expose ML outliers that pass physics.
+        temperatures = np.asarray([point["temperature"] for point in points], dtype=float)
+        elapsed = frame["Seconds_Elapsed"].to_numpy(dtype=float)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rates = np.diff(temperatures, prepend=temperatures[0]) / np.diff(elapsed, prepend=elapsed[0])
+        rates = np.nan_to_num(rates, nan=0.0, posinf=0.0, neginf=0.0)
+        ml_outlier_mask, ml_scores, mlops_metadata = train_and_register(
+            temperatures=temperatures,
+            rates=rates,
+            run_id=run_id,
+            source_path=file_path,
+            artifact_root=MLOPS_ARTIFACTS_DIR,
+            tracking_database=MLOPS_TRACKING_DB,
+            physics_veto_count=sum(point["physics_flag"] == "IMPLAUSIBLE" for point in points),
+        )
+        for point, is_outlier, score in zip(points, ml_outlier_mask, ml_scores):
+            point["ml_outlier"] = int(is_outlier)
+            point["isolation_forest_score"] = float(score)
+            if point["physics_flag"] == "VALID" and is_outlier:
+                point["quality"] = "STATISTICAL_OUTLIER"
+                point["reason"] = "Isolation Forest statistical outlier"
+
+        physics_anomalies = [point for point in points if point["physics_flag"] == "IMPLAUSIBLE"]
+        ml_anomalies = [point for point in points if point["physics_flag"] == "VALID" and point["ml_outlier"]]
+        anomalies = physics_anomalies + ml_anomalies
+        results = {"model": "physics", "file_name": os.path.basename(file_path),
+            "run_id": run_id,
+            "model_name": "Physics Constrained with Isolation Forest",
             "channel": str(sensor_col), "total_points": len(points), "total_anomalies": len(anomalies),
+            "physics_anomalies": len(physics_anomalies), "isolation_forest_anomalies": len(ml_anomalies),
             "anomaly_rate": round(len(anomalies) / len(points) * 100, 2), "points": points,
+            "mlops": mlops_metadata,
             "config": {"tau_seconds": tau, "tau_uncertainty_margin": margin, "sink_c": sink,
-                       "drive_max_c": drive_max, "sensor_min_c": sensor_min, "sensor_max_c": sensor_max}}})
+                       "drive_max_c": drive_max, "sensor_min_c": sensor_min, "sensor_max_c": sensor_max,
+                       **mlops_metadata["parameters"]}}
+        results_store[run_id] = sanitize(results)
+        return jsonify({"run_id": run_id, "results": results})
     except Exception as exc:
         traceback.print_exc()
         return jsonify({"error": f"Could not process CSV: {exc}"}), 400
+
+
+@app.route("/api/mlops/runs", methods=["GET"])
+def list_mlops_runs():
+    """List the most recent durable physics + Isolation Forest model runs."""
+    try:
+        limit = request.args.get("limit", default=50, type=int)
+        return jsonify({"runs": get_tracked_runs(MLOPS_TRACKING_DB, limit)})
+    except sqlite3.OperationalError:
+        return jsonify({"runs": []})
+
+
+@app.route("/api/mlops/runs/<run_id>", methods=["GET"])
+def get_mlops_run(run_id):
+    """Return durable metadata for one model training and scoring run."""
+    try:
+        run = get_tracked_run(MLOPS_TRACKING_DB, run_id)
+    except sqlite3.OperationalError:
+        run = None
+    if run is None:
+        return jsonify({"error": "Model run not found"}), 404
+    return jsonify({"run": run})
 
 
 @app.route("/api/feedback", methods=["POST"])

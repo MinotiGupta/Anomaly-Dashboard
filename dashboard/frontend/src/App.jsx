@@ -88,7 +88,7 @@ function App() {
         <div className="app-header__title-group">
           <h1 className="app-header__title">Anomaly Detection</h1>
           <p className="app-header__subtitle">
-            {modelType === 'physics' ? 'Physics Plausibility Model' : 'LSTM Autoencoder Pipeline'}
+            {modelType === 'physics' ? 'Physics Constrained with Isolation Forest' : 'LSTM Autoencoder Pipeline'}
             {results && results.data_type && (
               <span style={{ marginLeft: 12, color: 'var(--accent-blue)' }}>
                 / {dataTypeLabel(results.data_type)}
@@ -102,7 +102,7 @@ function App() {
             Model{' '}
             <select value={modelType} onChange={(e) => { setModelType(e.target.value); setResults(null); }} disabled={loading || Boolean(results)} style={{ padding: '7px 10px', borderRadius: 6, marginLeft: 4 }}>
               <option value="lstm">LSTM Autoencoder</option>
-              <option value="physics">Physics Plausibility (K-type probe)</option>
+              <option value="physics">Physics Constrained with Isolation Forest</option>
             </select>
           </label>
           {uploadedFile && (
@@ -171,7 +171,7 @@ function App() {
         <div className="progress-overlay">
           <div className="spinner" />
           <p className="progress-overlay__text">
-            {modelType === 'physics' ? 'Applying deterministic physics checks...' : 'Training LSTM Autoencoder and detecting anomalies...'}
+            {modelType === 'physics' ? 'Validating data, fitting Isolation Forest, and registering the run...' : 'Training LSTM Autoencoder and detecting anomalies...'}
           </p>
           <p className="progress-overlay__subtext">
             This runs the actual model — it may take a moment depending on data size.

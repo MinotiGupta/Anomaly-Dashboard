@@ -9,6 +9,7 @@ This project provides a robust, interactive dashboard to upload sensor data (CSV
 ## Key Features
 
 - **MLOps & Model Persistence:** Models and data scalers are saved locally after training. Subsequent runs on the same instrument data type load the saved PyTorch `.pth` weights for instant inference (no redundant training).
+- **Physics + Isolation Forest Run Tracking:** Each hybrid-model upload records a versioned, reproducible training run, data SHA-256, feature schema, parameters, package versions, fit/score timings, anomaly metrics, and a serialized model artifact. Runs are stored in the local model registry and SQLite tracking database.
 - **LSTM Autoencoder Pipeline:** Dynamically scales hidden layers based on the number of input features. Trains on uploaded data to learn normal behavior and flags sequences with high reconstruction error (MAE).
 - **Automatic Data Classification:** Intelligently parses CSV headers to identify the data source (Biomass, Cataluminescence, Swiss Roll, or Default 34970A instruments).
 - **Instrument Metadata Extraction:** Automatically extracts and displays hardware metadata (Model, Serial Number, Firmware, Channel Configurations) from Agilent/Keysight log files.
@@ -46,6 +47,8 @@ The core anomaly detection engine relies on a PyTorch-based **LSTM Autoencoder**
   - **Decoder:** An LSTM layer that takes the latent representation and attempts to reconstruct the original time-series sequence.
   - **Sliding Window:** Processes data in time-step sequences (e.g., 10 time steps per window).
   - **Anomaly Scoring:** The Mean Absolute Error (MAE) between the input sequence and the reconstructed sequence serves as the anomaly score. High MAE indicates the model hasn't seen this pattern before, flagging it as an anomaly.
+
+The **Physics Constrained with Isolation Forest** option follows a separate batch pipeline based on `new_15_iso_phy_modelling.ipynb`: it parses and validates the DAQ export, applies the K-type physical veto, engineers temperature and raw `dT/dt` features, fits and scores a deterministic Isolation Forest, validates the outputs, then registers the versioned artifact and run metadata. Because this notebook defines a per-file unsupervised fit and there is no separate labeled training corpus, the model is trained on each uploaded file; fast completion on a few thousand rows is expected. It does not add an artificial delay. Each successful run is visible in the result panel and through `GET /api/mlops/runs` or `GET /api/mlops/runs/<run_id>`.
 
 ## Architecture
 
